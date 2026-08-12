@@ -51,28 +51,14 @@ jobs:
         run: |
           set -euo pipefail
           copier copy --trust --defaults --force \
-            --data-file "tests/answers/${{ matrix.fixture }}.yml" . /tmp/render
+            --data-file "$GITHUB_WORKSPACE/tests/answers/${{ matrix.fixture }}.yml" \
+            "$GITHUB_WORKSPACE" /tmp/render
 
       - name: actionlint rendered callers
         run: cd /tmp/render && git init -q . && actionlint
 
       - name: kustomize build review overlay (at rest)
         run: kustomize build /tmp/render/deploy/overlays/review > /dev/null
-
-      - name: Simulate CI param rewrite, build again
-        run: |
-          set -euo pipefail
-          OVERLAY=/tmp/render/deploy/overlays/review
-          cat > "$OVERLAY/params.env" <<'EOF'
-          REVIEW_HOST=test-review2.example.com
-          REVIEW_URL=https://test-review2.example.com
-          PR_NUMBER=999
-          REVIEW_SLOT=2
-          EOF
-          cd "$OVERLAY"
-          kustomize edit set namespace test-pr999
-          kustomize build . | grep -q "host: test-review2.example.com" \
-            || { echo "::error::REVIEW_HOST replacement did not reach the ingress"; exit 1; }
 
       - name: Policy greps
         run: |
@@ -98,17 +84,37 @@ jobs:
             echo "::error::auth-bypass flag without basic_auth=true"; exit 1
           fi
 
+      # Runs on the PRISTINE render, before the param-rewrite simulation
+      # mutates the tree; both copier calls must spell the source path
+      # identically or _src_path/_commit churn in the answers file.
       - name: copier update idempotence
         run: |
           set -euo pipefail
           cd /tmp/render
-          git init -q . 2>/dev/null || true
           git add -A && git -c user.email=ci@ledoweb.com -c user.name=ci commit -qm render
           copier copy --trust --defaults --force \
             --data-file "$GITHUB_WORKSPACE/tests/answers/${{ matrix.fixture }}.yml" \
             "$GITHUB_WORKSPACE" .
-          if ! git diff --quiet; then
+          if ! git diff --quiet || [ -n "$(git status --porcelain)" ]; then
             echo "::error::re-render with identical answers produced a diff:"
             git diff | head -50
+            git status --porcelain
             exit 1
           fi
+
+      # LAST: this mutates params.env + the kustomization, exactly like the
+      # write-params action does at deploy time.
+      - name: Simulate CI param rewrite, build again
+        run: |
+          set -euo pipefail
+          OVERLAY=/tmp/render/deploy/overlays/review
+          cat > "$OVERLAY/params.env" <<'EOF'
+          REVIEW_HOST=test-review2.example.com
+          REVIEW_URL=https://test-review2.example.com
+          PR_NUMBER=999
+          REVIEW_SLOT=2
+          EOF
+          cd "$OVERLAY"
+          kustomize edit set namespace test-pr999
+          kustomize build . | grep -q "host: test-review2.example.com" \
+            || { echo "::error::REVIEW_HOST replacement did not reach the ingress"; exit 1; }
