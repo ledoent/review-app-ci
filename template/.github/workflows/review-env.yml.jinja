@@ -157,6 +157,9 @@ jobs:
       generated_secret_keys: "{{ generated_secret_keys }}"
 {%- endif %}
       basic_auth: "{{ basic_auth | lower }}"
+{%- if pull_secret_name != 'registry-pull' %}
+      pull_secret_name: {{ pull_secret_name }}
+{%- endif %}
       cluster_auth: {{ cluster_auth }}
 {%- if cluster_auth == 'gke-wif' %}
       wif_provider: {{ wif_provider }}

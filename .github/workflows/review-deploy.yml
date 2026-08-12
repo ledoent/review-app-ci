@@ -123,6 +123,10 @@ on:
         description: Namespace holding the wildcard TLS secret
         type: string
         default: shared-certs
+      pull_secret_name:
+        description: Name of the dockerconfig secret created from REGISTRY_PULL_TOKEN (must match the base Deployment's imagePullSecrets)
+        type: string
+        default: registry-pull
       rolebinding_clusterrole:
         description: ClusterRole to bind inside the review namespace ("" = skip; the grant dies with the namespace)
         type: string
@@ -323,6 +327,7 @@ jobs:
         env:
           REGISTRY_PULL_TOKEN: ${{ secrets.REGISTRY_PULL_TOKEN }}
           IMAGE: ${{ inputs.image }}
+          PULL_SECRET: ${{ inputs.pull_secret_name }}
         run: |
           set -euo pipefail
           if [ -z "$REGISTRY_PULL_TOKEN" ]; then
@@ -330,7 +335,7 @@ jobs:
             exit 0
           fi
           REG_HOST="${IMAGE%%/*}"
-          kubectl -n "$NS" create secret docker-registry registry-pull \
+          kubectl -n "$NS" create secret docker-registry "$PULL_SECRET" \
             --docker-server="$REG_HOST" \
             --docker-username=x-access-token \
             --docker-password="$REGISTRY_PULL_TOKEN" \

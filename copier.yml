@@ -15,6 +15,8 @@ _skip_if_exists:
   - deploy/overlays/staging/**
   - deploy/overlays/production/**
   - deploy/overlays/review/seed.sql
+  # DB sizing/image/owner are app decisions — hand-owned after first stamp.
+  - deploy/overlays/review/cnpg-cluster.yaml
 _message_after_copy: |
   Stamped. Now:
     1. Set the repo secrets/variables listed in docs/review-envs.md
@@ -253,3 +255,8 @@ slot_count:
   type: str
   default: "4"
   help: Size of the pre-registered hostname pool (raising it means registering new OAuth redirect URIs first)
+
+pull_secret_name:
+  type: str
+  default: registry-pull
+  help: imagePullSecrets name the base Deployment references (bimble's existing base uses ghcr-pull)
