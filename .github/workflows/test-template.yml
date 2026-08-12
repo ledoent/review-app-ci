@@ -38,10 +38,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Downloads happen OUTSIDE the workspace: a stray binary in the checkout
+      # makes the template repo dirty, and copier then stamps a fresh
+      # temp-commit SHA into _commit on every render — which broke the
+      # idempotence check with pure noise.
       - name: Install tools
         run: |
           set -euo pipefail
           pipx install copier
+          cd "$(mktemp -d)"
           curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.6.0/kustomize_v5.6.0_linux_amd64.tar.gz" | tar xz
           sudo install kustomize /usr/local/bin/
           bash <(curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12

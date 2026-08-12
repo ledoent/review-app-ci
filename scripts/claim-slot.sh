@@ -33,6 +33,13 @@ DOMAIN="${4:?usage: claim-slot.sh <app> <pr-number> <pool-size> <domain>}"
 SLOTS_NS="${SLOTS_NS:-review-slots}"
 SEL="review.ledoent.dev/app=$APP"
 
+# Without this, a missing namespace makes every lease create fail and the
+# script reports "all slots taken" — observed on the first pilot run.
+if ! kubectl get namespace "$SLOTS_NS" >/dev/null 2>&1; then
+  echo "::error::the $SLOTS_NS namespace does not exist on this cluster — apply the review-platform infra (review-slots namespace + RBAC) before deploying review environments"
+  exit 1
+fi
+
 emit() { # emit <slot>
   local slot="$1" host
   host="$APP-review$1.$DOMAIN"
