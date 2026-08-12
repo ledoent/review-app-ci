@@ -1,0 +1,52 @@
+# MANAGED BY ledoent/review-app-ci — edit answers via `copier update`, not here.
+#
+# Deliberately NO paths filters on this workflow: a paths-ignore that happens
+# to match the closing commit silently eats the `closed` event and leaks the
+# environment.
+name: Review cleanup
+on:
+  pull_request:
+{%- if review_trigger == 'label' %}
+    types: [closed, unlabeled]
+{%- else %}
+    types: [closed]
+{%- endif %}
+
+concurrency:
+  group: {% raw %}review-env-${{ github.event.pull_request.number }}{% endraw %}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  teardown:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+{%- if review_trigger == 'label' %}
+      && (github.event.action == 'closed' || !contains(github.event.pull_request.labels.*.name, '{{ review_label }}'))
+{%- endif %}
+    uses: ledoent/review-app-ci/.github/workflows/review-teardown.yml@v1
+    with:
+      app_name: {{ app_name }}
+{%- if db_mode == 'shared-cnpg-database' %}
+      db_name_prefix: {{ db_name_prefix | replace('_', '-') }}
+      staging_namespace: {{ shared_backend_namespace }}
+{%- endif %}
+{%- if registry == 'ghcr' %}
+      delete_pr_image: "true"
+      package_name: {{ repo_slug }}
+{%- endif %}
+      cluster_auth: {{ cluster_auth }}
+{%- if cluster_auth == 'gke-wif' %}
+      wif_provider: {{ wif_provider }}
+      gcp_service_account: {{ gcp_service_account }}
+      gcp_project: {{ gcp_project }}
+      gke_cluster: {{ gke_cluster }}
+      gke_zone: {{ gke_zone }}
+{%- endif %}
+      runs_on: {{ runner }}
+    secrets:
+      KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}

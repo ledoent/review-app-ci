@@ -1,0 +1,195 @@
+{%- set fork_guard = "github.event.pull_request.head.repo.full_name == github.repository" -%}
+{%- if review_trigger == 'label' -%}
+{%- set gate = fork_guard ~ " && contains(github.event.pull_request.labels.*.name, '" ~ review_label ~ "')" -%}
+{%- else -%}
+{%- set gate = fork_guard -%}
+{%- endif -%}
+# MANAGED BY ledoent/review-app-ci — edit answers via `copier update`, not here.
+name: Review environment
+on:
+  pull_request:
+{%- if review_trigger == 'label' %}
+    types: [opened, synchronize, reopened, labeled]
+{%- else %}
+    types: [opened, synchronize, reopened]
+{%- endif %}
+
+concurrency:
+  group: {% raw %}review-env-${{ github.event.pull_request.number }}{% endraw %}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+{%- if host_in_build %}
+  claim:
+    if: {{ gate }}
+    uses: ledoent/review-app-ci/.github/workflows/review-claim.yml@v1
+    with:
+      app_name: {{ app_name }}
+      base_domain: {{ review_domain }}
+      slot_count: "{{ slot_count }}"
+      cluster_auth: {{ cluster_auth }}
+{%- if cluster_auth == 'gke-wif' %}
+      wif_provider: {{ wif_provider }}
+      gcp_service_account: {{ gcp_service_account }}
+      gcp_project: {{ gcp_project }}
+      gke_cluster: {{ gke_cluster }}
+      gke_zone: {{ gke_zone }}
+{%- endif %}
+{%- if db_mode == 'shared-cnpg-database' %}
+      db_name_prefix: {{ db_name_prefix | replace('_', '-') }}
+      staging_namespace: {{ shared_backend_namespace }}
+{%- endif %}
+      runs_on: {{ runner }}
+    secrets:
+      KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}
+{%- endif %}
+
+  build:
+{%- if host_in_build %}
+    needs: claim
+{%- endif %}
+    if: {{ gate }}
+    runs-on: {{ runner }}
+    outputs:
+      tag: {% raw %}${{ steps.tag.outputs.tag }}{% endraw %}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        env:
+          PR: {% raw %}${{ github.event.pull_request.number }}{% endraw %}
+          SHA: {% raw %}${{ github.event.pull_request.head.sha }}{% endraw %}
+        run: echo "tag=pr-${PR}-$(echo "$SHA" | cut -c1-8)" >> "$GITHUB_OUTPUT"
+{%- if cluster_auth == 'gke-wif' %}
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: {{ gcp_project }}
+          workload_identity_provider: {{ wif_provider }}
+          service_account: {{ gcp_service_account }}
+      - uses: google-github-actions/setup-gcloud@v2
+{%- endif %}
+      - uses: ledoent/review-app-ci/actions/registry-login@v1
+        with:
+          registry: {{ registry }}
+{%- if registry == 'ghcr' %}
+          username: {% raw %}${{ github.actor }}{% endraw %}
+          password: {% raw %}${{ secrets.GITHUB_TOKEN }}{% endraw %}
+{%- elif registry == 'gar' %}
+          gar-location: {{ gar_location }}
+{%- elif registry == 'zot' %}
+          zot-host: {{ zot_host }}
+          username: {% raw %}${{ secrets.ZOT_USERNAME }}{% endraw %}
+          password: {% raw %}${{ secrets.ZOT_PASSWORD }}{% endraw %}
+{%- endif %}
+      - uses: docker/setup-buildx-action@v3
+      # Immutable per-push tag: a mutable tag would let a review environment
+      # quietly serve a different commit than the one being reviewed.
+      - name: Build & push
+        env:
+          TAG: {% raw %}${{ steps.tag.outputs.tag }}{% endraw %}
+{%- if host_in_build %}
+          REVIEW_URL: {% raw %}${{ needs.claim.outputs.url }}{% endraw %}
+{%- endif %}
+          IMAGE: {{ image_ref }}
+        run: |
+          docker buildx build \
+            --output type=image,push=true,oci-mediatypes=true \
+            --cache-from "type=registry,ref=${IMAGE}:buildcache" \
+            --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
+{%- if host_in_build %}
+            --build-arg NEXT_PUBLIC_SITE_URL="$REVIEW_URL" \
+{%- endif %}
+            -f {{ dockerfile }} \
+            -t "${IMAGE}:${TAG}" \
+            {{ build_context }}
+
+  review:
+{%- if host_in_build %}
+    needs: [claim, build]
+{%- else %}
+    needs: build
+{%- endif %}
+    uses: ledoent/review-app-ci/.github/workflows/review-deploy.yml@v1
+    with:
+      app_name: {{ app_name }}
+      image: {{ image_ref }}
+      image_tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
+{%- if host_in_build %}
+      slot: {% raw %}${{ needs.claim.outputs.slot }}{% endraw %}
+      host: {% raw %}${{ needs.claim.outputs.host }}{% endraw %}
+{%- endif %}
+      base_domain: {{ review_domain }}
+      slot_count: "{{ slot_count }}"
+      tier: {{ review_tier }}
+{%- if review_tier == 'light' %}
+      staging_namespace: {{ shared_backend_namespace }}
+{%- if staging_deployments %}
+      staging_deployments: "{{ staging_deployments }}"
+{%- endif %}
+{%- elif shared_secrets_to_copy %}
+      staging_namespace: {{ app_name }}-staging
+{%- endif %}
+{%- if shared_secrets_to_copy %}
+      copy_secrets: "{{ shared_secrets_to_copy }}"
+{%- endif %}
+      db_mode: {{ db_mode }}
+{%- if db_mode in ['sql-configmap', 'shared-cnpg-database'] %}
+      cnpg_cluster_name: {{ cnpg_cluster_name }}
+{%- endif %}
+{%- if db_mode == 'shared-cnpg-database' %}
+      db_name_prefix: {{ db_name_prefix | replace('_', '-') }}
+{%- if db_secret_name %}
+      db_secret_name: {{ db_secret_name }}
+{%- endif %}
+{%- endif %}
+{%- if db_mode == 'sql-configmap' and use_seed_sql %}
+      seed_path: deploy/overlays/review/seed.sql
+{%- endif %}
+{%- if db_mode == 'app-endpoint' and seed_command %}
+      seed_command: "{{ seed_command }}"
+{%- endif %}
+{%- if generated_secret_keys %}
+      generated_secret_keys: "{{ generated_secret_keys }}"
+{%- endif %}
+      basic_auth: "{{ basic_auth | lower }}"
+      cluster_auth: {{ cluster_auth }}
+{%- if cluster_auth == 'gke-wif' %}
+      wif_provider: {{ wif_provider }}
+      gcp_service_account: {{ gcp_service_account }}
+      gcp_project: {{ gcp_project }}
+      gke_cluster: {{ gke_cluster }}
+      gke_zone: {{ gke_zone }}
+{%- endif %}
+      runs_on: {{ runner }}
+    secrets:
+      KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}
+      REGISTRY_PULL_TOKEN: {% raw %}${{ secrets.REGISTRY_PULL_TOKEN }}{% endraw %}
+      BASIC_AUTH_HTPASSWD: {% raw %}${{ secrets.BASIC_AUTH_HTPASSWD }}{% endraw %}
+      SEED_ENV: {% raw %}${{ secrets.SEED_ENV }}{% endraw %}
+{%- if e2e_command or lighthouse_paths %}
+
+  gates:
+    needs: review
+    uses: ledoent/review-app-ci/.github/workflows/test-gates.yml@v1
+    with:
+      base_url: {% raw %}${{ needs.review.outputs.url }}{% endraw %}
+{%- if e2e_command %}
+      e2e_command: "{{ e2e_command }}"
+      e2e_container: "{{ e2e_container }}"
+{%- endif %}
+{%- if lighthouse_paths %}
+      lighthouse_paths: |-
+{%- for p in lighthouse_paths.split(',') %}
+        {{ p | trim }}
+{%- endfor %}
+{%- endif %}
+      runs_on: {{ runner }}
+    secrets:
+      E2E_ENV: {% raw %}${{ secrets.E2E_ENV }}{% endraw %}
+      BASIC_AUTH_CREDS: {% raw %}${{ secrets.BASIC_AUTH_CREDS }}{% endraw %}
+{%- endif %}

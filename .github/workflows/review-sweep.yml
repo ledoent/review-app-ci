@@ -1,0 +1,92 @@
+name: Review sweep (reusable)
+
+# Nightly reaper. Callers own the cron and pass dry_run=false from schedule
+# runs; a manual dispatch defaults to dry_run=true so a human can be shown the
+# list first. Full pass documentation lives in scripts/sweep.sh.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      ns_prefix:
+        description: Namespace prefix — THE safety boundary between apps on a shared cluster
+        type: string
+        default: ""
+      db_name_prefix:
+        description: Database CR prefix (light tier); "" skips the orphan-CR pass
+        type: string
+        default: ""
+      staging_namespace:
+        type: string
+        default: ""
+      ttl_hours:
+        type: string
+        default: "48"
+      review_labels:
+        description: Comma list; when set, open PRs must carry one to keep their env
+        type: string
+        default: ""
+      dry_run:
+        type: string
+        default: "true"
+      cluster_auth:
+        type: string
+        default: kubeconfig
+      wif_provider:
+        type: string
+        default: ""
+      gcp_service_account:
+        type: string
+        default: ""
+      gcp_project:
+        type: string
+        default: ""
+      gke_cluster:
+        type: string
+        default: ""
+      gke_zone:
+        type: string
+        default: ""
+      runs_on:
+        type: string
+        default: ubuntu-latest
+    secrets:
+      KUBE_CONFIG:
+        required: false
+
+jobs:
+  sweep:
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - name: Checkout review-app-ci
+        uses: actions/checkout@v4
+        with:
+          repository: ledoent/review-app-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .review-ci
+
+      - name: Setup deploy tools
+        uses: ./.review-ci/actions/setup-deploy
+        with:
+          cluster-auth: ${{ inputs.cluster_auth }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          wif-provider: ${{ inputs.wif_provider }}
+          gcp-service-account: ${{ inputs.gcp_service_account }}
+          gcp-project: ${{ inputs.gcp_project }}
+          gke-cluster: ${{ inputs.gke_cluster }}
+          gke-zone: ${{ inputs.gke_zone }}
+
+      - name: Sweep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          APP: ${{ inputs.app_name }}
+          NS_PREFIX: ${{ inputs.ns_prefix }}
+          DB_CR_PREFIX: ${{ inputs.db_name_prefix && format('{0}-pr', inputs.db_name_prefix) || '' }}
+          STAGING_NS: ${{ inputs.staging_namespace }}
+          TTL_HOURS: ${{ inputs.ttl_hours }}
+          REVIEW_LABELS: ${{ inputs.review_labels }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: ./.review-ci/scripts/sweep.sh "$APP"

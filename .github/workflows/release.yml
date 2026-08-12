@@ -1,0 +1,39 @@
+name: Release
+
+# Tag a semver release and force-move the floating major tag. Consumers pin
+# `@v1`; a fix ships by tagging v1.x.y here — no copier update needed unless
+# the stamped surface (caller inputs, triggers, secrets contract) changed.
+#
+# NEVER add a required input to an existing major: new inputs get defaults,
+# or the change is the next major.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver to release, e.g. 1.2.3 (no leading v)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate + tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::version must be X.Y.Z, got '$VERSION'"; exit 1; }
+          MAJOR="v${VERSION%%.*}"
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git tag -a "v$VERSION" -m "release v$VERSION"
+          git tag -fa "$MAJOR" -m "floating major -> v$VERSION"
+          git push origin "v$VERSION"
+          git push -f origin "$MAJOR"
+          echo "released v$VERSION; $MAJOR now points at it"

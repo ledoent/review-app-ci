@@ -1,0 +1,45 @@
+name: Sticky PR comment
+description: >-
+  Upsert a PR comment keyed on a hidden HTML marker: finds the existing comment
+  carrying the marker and edits it in place, else creates one. Repeated pushes
+  update a single comment instead of piling new ones onto the PR.
+
+inputs:
+  marker:
+    description: Stable key for this comment, e.g. review-env
+    required: true
+  body:
+    description: Comment body (markdown; the marker is prepended automatically)
+    required: true
+  pr-number:
+    description: PR number
+    required: true
+  token:
+    description: Token with pull-requests:write
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Upsert comment
+      uses: actions/github-script@v7
+      env:
+        MARKER: ${{ inputs.marker }}
+        BODY: ${{ inputs.body }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const marker = `<!-- ${process.env.MARKER} -->`;
+          const body = `${marker}\n${process.env.BODY}`;
+          const issue_number = Number(process.env.PR_NUMBER);
+          const { owner, repo } = context.repo;
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner, repo, issue_number, per_page: 100,
+          });
+          const existing = comments.find(c => c.body && c.body.startsWith(marker));
+          if (existing) {
+            await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+          } else {
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+          }

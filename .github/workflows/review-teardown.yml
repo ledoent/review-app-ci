@@ -1,0 +1,120 @@
+name: Review teardown (reusable)
+
+# Destroys one PR's review environment. Callers trigger on
+# `pull_request: [closed]` — and `unlabeled` for label-gated apps, with the
+# label decision made in the caller's `if:`.
+#
+# ORDER (encoded in scripts/reap-review-env.sh + release-slot.sh, shared with
+# the sweep so it exists in exactly one place):
+#   namespace -> pod drain -> Database CR -> ingress-gone wait -> slot lease.
+# The lease goes LAST: a freed slot must never still be served by a dying
+# ingress.
+#
+# --strict: teardown is the caller that knows the environment was meant to go
+# away right now, so a Database CR left behind is a red job, not a green one
+# that quietly leaves a database in staging. The sweep deliberately differs.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      db_name_prefix:
+        description: Database CR prefix (light tier); "" = full tier, CR dies with the namespace
+        type: string
+        default: ""
+      staging_namespace:
+        type: string
+        default: ""
+      delete_pr_image:
+        description: '"true" = delete the GHCR pr-<N> package version (ghcr only)'
+        type: string
+        default: "false"
+      package_name:
+        description: GHCR package name for delete_pr_image (defaults to the repo name)
+        type: string
+        default: ""
+      cluster_auth:
+        type: string
+        default: kubeconfig
+      wif_provider:
+        type: string
+        default: ""
+      gcp_service_account:
+        type: string
+        default: ""
+      gcp_project:
+        type: string
+        default: ""
+      gke_cluster:
+        type: string
+        default: ""
+      gke_zone:
+        type: string
+        default: ""
+      runs_on:
+        type: string
+        default: ubuntu-latest
+    secrets:
+      KUBE_CONFIG:
+        required: false
+
+jobs:
+  teardown:
+    runs-on: ${{ inputs.runs_on }}
+    env:
+      APP: ${{ inputs.app_name }}
+      PR: ${{ github.event.pull_request.number }}
+      STAGING_NS: ${{ inputs.staging_namespace }}
+    steps:
+      - name: Checkout review-app-ci
+        uses: actions/checkout@v4
+        with:
+          repository: ledoent/review-app-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .review-ci
+
+      - name: Setup deploy tools
+        uses: ./.review-ci/actions/setup-deploy
+        with:
+          cluster-auth: ${{ inputs.cluster_auth }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          wif-provider: ${{ inputs.wif_provider }}
+          gcp-service-account: ${{ inputs.gcp_service_account }}
+          gcp-project: ${{ inputs.gcp_project }}
+          gke-cluster: ${{ inputs.gke_cluster }}
+          gke-zone: ${{ inputs.gke_zone }}
+
+      - name: Destroy environment
+        env:
+          PREFIX: ${{ inputs.db_name_prefix }}
+        run: |
+          set -euo pipefail
+          DB_CR="-"
+          [ -n "$PREFIX" ] && DB_CR="${PREFIX}-pr${PR}"
+          ./.review-ci/scripts/reap-review-env.sh "$APP-pr$PR" "$DB_CR" --strict
+
+      - name: Release slot lease
+        run: ./.review-ci/scripts/release-slot.sh "$APP" "$PR"
+
+      # Best-effort: a stale image tag is clutter, not a leak, so this must
+      # not fail the teardown that just cleaned up real resources.
+      - name: Delete pr image tag (ghcr)
+        if: inputs.delete_pr_image == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ inputs.package_name }}
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          PKG="${PACKAGE:-${GITHUB_REPOSITORY##*/}}"
+          version_id=$(gh api "orgs/$OWNER/packages/container/$PKG/versions" --paginate \
+            --jq ".[] | select(.metadata.container.tags[]? == \"pr-$PR\") | .id" | head -1)
+          if [ -n "$version_id" ]; then
+            gh api -X DELETE "orgs/$OWNER/packages/container/$PKG/versions/$version_id"
+            echo "deleted pr-$PR package version $version_id"
+          else
+            echo "no pr-$PR package version found"
+          fi

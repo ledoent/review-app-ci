@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ app_name }}
+  labels:
+    app: {{ app_name }}
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ production_host | default(app_name ~ '.' ~ review_domain) }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ app_name }}
+                port:
+                  number: 80

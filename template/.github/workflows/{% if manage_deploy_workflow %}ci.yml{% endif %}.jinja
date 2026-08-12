@@ -1,0 +1,110 @@
+# MANAGED BY ledoent/review-app-ci — edit answers via `copier update`, not here.
+#
+# Promotion ladder: push to main -> staging; tag v* -> production (behind the
+# GitHub `production` environment, so protection rules apply there).
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: {% raw %}ci-${{ github.ref }}{% endraw %}
+  # main pushes serialise instead of cancelling: a cancelled deploy leaves the
+  # overlay half-applied.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: {{ runner }}
+    outputs:
+      tag: {% raw %}${{ steps.tag.outputs.tag }}{% endraw %}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+{%- if cluster_auth == 'gke-wif' %}
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: {{ gcp_project }}
+          workload_identity_provider: {{ wif_provider }}
+          service_account: {{ gcp_service_account }}
+      - uses: google-github-actions/setup-gcloud@v2
+{%- endif %}
+      - uses: ledoent/review-app-ci/actions/registry-login@v1
+        with:
+          registry: {{ registry }}
+{%- if registry == 'ghcr' %}
+          username: {% raw %}${{ github.actor }}{% endraw %}
+          password: {% raw %}${{ secrets.GITHUB_TOKEN }}{% endraw %}
+{%- elif registry == 'gar' %}
+          gar-location: {{ gar_location }}
+{%- elif registry == 'zot' %}
+          zot-host: {{ zot_host }}
+          username: {% raw %}${{ secrets.ZOT_USERNAME }}{% endraw %}
+          password: {% raw %}${{ secrets.ZOT_PASSWORD }}{% endraw %}
+{%- endif %}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push
+        env:
+          TAG: {% raw %}${{ steps.tag.outputs.tag }}{% endraw %}
+          IMAGE: {{ image_ref }}
+        run: |
+          docker buildx build \
+            --output type=image,push=true,oci-mediatypes=true \
+            --cache-from "type=registry,ref=${IMAGE}:buildcache" \
+            --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
+            -f {{ dockerfile }} \
+            -t "${IMAGE}:${TAG}" \
+            {{ build_context }}
+
+  deploy-staging:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    uses: ledoent/review-app-ci/.github/workflows/deploy-env.yml@v1
+    with:
+      environment: staging
+      app_name: {{ app_name }}
+      image: {{ image_ref }}
+      image_tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
+      env_url: https://{{ staging_host }}
+      cluster_auth: {{ cluster_auth }}
+{%- if cluster_auth == 'gke-wif' %}
+      wif_provider: {{ wif_provider }}
+      gcp_service_account: {{ gcp_service_account }}
+      gcp_project: {{ gcp_project }}
+      gke_cluster: {{ gke_cluster }}
+      gke_zone: {{ gke_zone }}
+{%- endif %}
+      runs_on: {{ runner }}
+    secrets:
+      KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}
+      APP_ENV: {% raw %}${{ secrets.APP_ENV_STAGING }}{% endraw %}
+
+  deploy-production:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ledoent/review-app-ci/.github/workflows/deploy-env.yml@v1
+    with:
+      environment: production
+      app_name: {{ app_name }}
+      image: {{ image_ref }}
+      image_tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
+      env_url: https://{{ production_host }}
+      cluster_auth: {{ cluster_auth }}
+{%- if cluster_auth == 'gke-wif' %}
+      wif_provider: {{ wif_provider }}
+      gcp_service_account: {{ gcp_service_account }}
+      gcp_project: {{ gcp_project }}
+      gke_cluster: {{ gke_cluster }}
+      gke_zone: {{ gke_zone }}
+{%- endif %}
+      runs_on: {{ runner }}
+    secrets:
+      KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}
+      APP_ENV: {% raw %}${{ secrets.APP_ENV_PRODUCTION }}{% endraw %}

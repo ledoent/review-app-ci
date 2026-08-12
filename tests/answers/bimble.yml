@@ -1,0 +1,18 @@
+app_name: bimble
+repo_slug: bimble-platform
+github_org: ledoent
+registry: ghcr
+cluster_auth: kubeconfig
+review_trigger: auto
+review_tier: full
+db_mode: sql-configmap
+cnpg_cluster_name: bimble-db
+use_seed_sql: true
+basic_auth: true
+host_in_build: false
+e2e_command: "pnpm --filter @bimble/web test:e2e"
+e2e_container: "ghcr.io/ledoent/bimble-platform/ci-runner:latest"
+lighthouse_paths: "/,/parent,/parent/progress,/parent/wall,/parent/values"
+manage_deploy_workflow: true
+scaffold_k8s_manifests: true
+slot_count: "4"

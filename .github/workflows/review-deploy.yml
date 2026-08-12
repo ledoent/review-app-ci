@@ -1,0 +1,575 @@
+name: Review deploy (reusable)
+
+# Deploys a per-PR review environment onto a claimed hostname slot.
+#
+# Namespace keys off the PR NUMBER (<app>-pr<N>): branch-derived names read
+# nicely but teardown cannot reconstruct them once the branch is deleted — and
+# `closed` frequently arrives after the delete. A number always exists.
+# The hostname comes from a claimed slot lease (see scripts/claim-slot.sh),
+# never from the PR number directly: slot hostnames are pre-registered OAuth
+# redirect URIs and must outlive any one PR.
+#
+# workflow_call cannot express `type: choice`, hence plain strings validated in
+# the first step of the job.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: Short app slug; namespace prefix and slot pool key
+        type: string
+        required: true
+      image:
+        description: Untagged image reference (already pushed by the caller's build job)
+        type: string
+        required: true
+      image_tag:
+        description: Immutable per-push tag from the caller's build job
+        type: string
+        required: true
+      migrator_image:
+        description: Optional migration image (untagged); run as a Job before rollout wait
+        type: string
+        default: ""
+      base_domain:
+        description: Review domain (hz.ledoweb.com | mi.ledoweb.com)
+        type: string
+        default: hz.ledoweb.com
+      slot_count:
+        description: Size of the pre-registered hostname pool
+        type: string
+        default: "4"
+      slot:
+        description: Pre-claimed slot index (from review-claim.yml when the host is baked into the image at build time). Empty = claim here.
+        type: string
+        default: ""
+      host:
+        description: Pre-claimed slot hostname (required when slot is set)
+        type: string
+        default: ""
+      overlay:
+        description: Review overlay path
+        type: string
+        default: deploy/overlays/review
+      deployment_name:
+        description: Name of the Deployment to await (defaults to app_name)
+        type: string
+        default: ""
+      tier:
+        description: "light (borrow backend from staging, own Database CR there) | full (self-contained)"
+        type: string
+        default: full
+      staging_namespace:
+        description: Staging namespace (required for tier=light and for copy_secrets)
+        type: string
+        default: ""
+      staging_deployments:
+        description: Comma list of deployments that must exist in staging (light-tier preflight)
+        type: string
+        default: ""
+      copy_secrets:
+        description: Comma list of secret names copied from staging_namespace (metadata-stripped)
+        type: string
+        default: ""
+      generated_secret_name:
+        description: Secret to hold per-env generated keys (created once, kept across redeploys)
+        type: string
+        default: ""
+      generated_secret_keys:
+        description: Comma list of keys to fill with openssl rand -hex 32
+        type: string
+        default: ""
+      db_mode:
+        description: "none | sql-configmap | shared-cnpg-database | app-endpoint | restore-prod"
+        type: string
+        default: none
+      cnpg_cluster_name:
+        description: CNPG Cluster name (full tier wait / light tier -rw service host)
+        type: string
+        default: ""
+      db_name_prefix:
+        description: "Database name prefix for shared-cnpg-database; CR = <prefix>-pr<N> (hyphens), db = <prefix>_pr<N> (underscores)"
+        type: string
+        default: ""
+      db_owner:
+        description: Postgres role owning the per-PR database (shared-cnpg-database)
+        type: string
+        default: app
+      db_secret_name:
+        description: Staging secret holding user/password for URI synthesis (shared-cnpg-database)
+        type: string
+        default: ""
+      seed_path:
+        description: Path to seed.sql (db_mode=sql-configmap)
+        type: string
+        default: ""
+      seed_command:
+        description: Repo script run after rollout with REVIEW_URL/NAMESPACE env (db_mode=app-endpoint)
+        type: string
+        default: ""
+      basic_auth:
+        description: '"true" = annotate the review ingress with nginx basic auth. MANDATORY for apps with an auth-bypass flag.'
+        type: string
+        default: "false"
+      ingress_name:
+        description: Ingress name to annotate for basic auth (defaults to app_name)
+        type: string
+        default: ""
+      wildcard_secret:
+        description: TLS secret copied from wildcard_source_ns into the review namespace ("" = skip)
+        type: string
+        default: wildcard-tls
+      wildcard_source_ns:
+        description: Namespace holding the wildcard TLS secret
+        type: string
+        default: shared-certs
+      rolebinding_clusterrole:
+        description: ClusterRole to bind inside the review namespace ("" = skip; the grant dies with the namespace)
+        type: string
+        default: ""
+      deploy_identity:
+        description: User/SA the rolebinding grants (required when rolebinding_clusterrole set)
+        type: string
+        default: ""
+      cluster_auth:
+        description: "kubeconfig | gke-wif"
+        type: string
+        default: kubeconfig
+      wif_provider:
+        type: string
+        default: ""
+      gcp_service_account:
+        type: string
+        default: ""
+      gcp_project:
+        type: string
+        default: ""
+      gke_cluster:
+        type: string
+        default: ""
+      gke_zone:
+        type: string
+        default: ""
+      runs_on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+      comment_extra:
+        description: Extra markdown appended to the review PR comment
+        type: string
+        default: ""
+    secrets:
+      KUBE_CONFIG:
+        required: false
+      REGISTRY_PULL_TOKEN:
+        description: Optional dockerconfig token; creates the registry-pull secret
+        required: false
+      BASIC_AUTH_HTPASSWD:
+        description: htpasswd line(s) for the basic-auth secret (basic_auth=true)
+        required: false
+      SEED_ENV:
+        description: dotenv blob exported before seed_command runs
+        required: false
+    outputs:
+      url:
+        value: ${{ jobs.deploy.outputs.url }}
+      host:
+        value: ${{ jobs.deploy.outputs.host }}
+      namespace:
+        value: ${{ jobs.deploy.outputs.namespace }}
+      slot:
+        value: ${{ jobs.deploy.outputs.slot }}
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs_on }}
+    outputs:
+      url: ${{ steps.slot.outputs.url }}
+      host: ${{ steps.slot.outputs.host }}
+      namespace: ${{ steps.slot.outputs.namespace }}
+      slot: ${{ steps.slot.outputs.slot }}
+    environment:
+      name: review-pr${{ github.event.pull_request.number }}
+      url: ${{ steps.slot.outputs.url }}
+    env:
+      APP: ${{ inputs.app_name }}
+      PR: ${{ github.event.pull_request.number }}
+      NS: ${{ inputs.app_name }}-pr${{ github.event.pull_request.number }}
+      STAGING_NS: ${{ inputs.staging_namespace }}
+      SLOTS_NS: review-slots
+    steps:
+      - name: Validate inputs
+        env:
+          TIER: ${{ inputs.tier }}
+          DB_MODE: ${{ inputs.db_mode }}
+          CLUSTER_AUTH: ${{ inputs.cluster_auth }}
+          SLOT_IN: ${{ inputs.slot }}
+          HOST_IN: ${{ inputs.host }}
+        run: |
+          set -euo pipefail
+          case "$TIER" in light|full) ;; *) echo "::error::tier must be light or full, got '$TIER'"; exit 1 ;; esac
+          case "$DB_MODE" in none|sql-configmap|shared-cnpg-database|app-endpoint|restore-prod) ;;
+            *) echo "::error::unknown db_mode '$DB_MODE'"; exit 1 ;; esac
+          case "$CLUSTER_AUTH" in kubeconfig|gke-wif) ;; *) echo "::error::unknown cluster_auth '$CLUSTER_AUTH'"; exit 1 ;; esac
+          if [ "$DB_MODE" = "restore-prod" ]; then
+            echo "::error::db_mode=restore-prod is not implemented yet (planned for the website migration)"; exit 1
+          fi
+          if [ "$TIER" = "light" ] && [ -z "$STAGING_NS" ]; then
+            echo "::error::tier=light requires staging_namespace"; exit 1
+          fi
+          if [ -n "$SLOT_IN" ] && [ -z "$HOST_IN" ]; then
+            echo "::error::when slot is pre-claimed, host must be passed too"; exit 1
+          fi
+
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
+      # Scripts and composite actions come from review-app-ci at the SAME
+      # commit as this workflow file — github.job_workflow_sha — so a floating
+      # v1 tag can never pair a new workflow with old scripts or vice versa.
+      - name: Checkout review-app-ci
+        uses: actions/checkout@v4
+        with:
+          repository: ledoent/review-app-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .review-ci
+
+      - name: Setup deploy tools
+        uses: ./.review-ci/actions/setup-deploy
+        with:
+          cluster-auth: ${{ inputs.cluster_auth }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          wif-provider: ${{ inputs.wif_provider }}
+          gcp-service-account: ${{ inputs.gcp_service_account }}
+          gcp-project: ${{ inputs.gcp_project }}
+          gke-cluster: ${{ inputs.gke_cluster }}
+          gke-zone: ${{ inputs.gke_zone }}
+
+      - name: Claim hostname slot
+        id: slot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLOT_IN: ${{ inputs.slot }}
+          HOST_IN: ${{ inputs.host }}
+          SLOT_COUNT: ${{ inputs.slot_count }}
+          DOMAIN: ${{ inputs.base_domain }}
+          DB_CR_PREFIX: ${{ inputs.db_name_prefix && format('{0}-pr', inputs.db_name_prefix) || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SLOT_IN" ]; then
+            # Claimed earlier by review-claim.yml (host was needed at build
+            # time). Re-emit so downstream steps and outputs have one source.
+            {
+              echo "slot=$SLOT_IN"
+              echo "host=$HOST_IN"
+              echo "url=https://$HOST_IN"
+              echo "namespace=$NS"
+            } >> "$GITHUB_OUTPUT"
+          else
+            ./.review-ci/scripts/claim-slot.sh "$APP" "$PR" "$SLOT_COUNT" "$DOMAIN"
+          fi
+
+      # Belt-and-braces against a lease freed while a stale ingress still
+      # serves the hostname: refuse to deploy onto a host any OTHER namespace
+      # still claims.
+      - name: Ingress preflight
+        env:
+          HOST: ${{ steps.slot.outputs.host }}
+        run: |
+          set -euo pipefail
+          holder=$(kubectl get ingress -A -o json \
+            | jq -r --arg h "$HOST" --arg ns "$NS" \
+                '.items[] | select(.spec.rules[]?.host == $h) | select(.metadata.namespace != $ns) | .metadata.namespace' \
+            | head -1)
+          if [ -n "$holder" ]; then
+            echo "::error::host $HOST is still served by namespace $holder — its teardown has not finished. Retry shortly."
+            exit 1
+          fi
+
+      # The light tier borrows its backend from staging. If staging is down it
+      # would deploy an app that cannot reach an API and fail on a readiness
+      # probe minutes later, which reads like a broken change rather than a
+      # missing dependency.
+      - name: Light-tier preflight
+        if: inputs.tier == 'light'
+        env:
+          DEPLOYMENTS: ${{ inputs.staging_deployments }}
+        run: |
+          set -euo pipefail
+          kubectl get namespace "$STAGING_NS" >/dev/null 2>&1 \
+            || { echo "::error::$STAGING_NS does not exist, and tier=light borrows its backend."; exit 1; }
+          IFS=',' read -ra deps <<< "$DEPLOYMENTS"
+          for d in "${deps[@]}"; do
+            [ -n "$d" ] || continue
+            kubectl -n "$STAGING_NS" get deploy "$d" >/dev/null 2>&1 \
+              || { echo "::error::$STAGING_NS has no $d — staging is only partly up."; exit 1; }
+          done
+
+      - name: Namespace and in-namespace grant
+        env:
+          CLUSTERROLE: ${{ inputs.rolebinding_clusterrole }}
+          IDENTITY: ${{ inputs.deploy_identity }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          if [ -n "$CLUSTERROLE" ]; then
+            # The grant lives inside the ephemeral namespace and dies with it.
+            kubectl create rolebinding "$CLUSTERROLE" \
+              --clusterrole="$CLUSTERROLE" --user="$IDENTITY" -n "$NS" \
+              --dry-run=client -o yaml | kubectl apply -f -
+          fi
+
+      - name: Registry pull secret
+        env:
+          REGISTRY_PULL_TOKEN: ${{ secrets.REGISTRY_PULL_TOKEN }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REGISTRY_PULL_TOKEN" ]; then
+            echo "no REGISTRY_PULL_TOKEN; assuming the cluster pulls without one"
+            exit 0
+          fi
+          REG_HOST="${IMAGE%%/*}"
+          kubectl -n "$NS" create secret docker-registry registry-pull \
+            --docker-server="$REG_HOST" \
+            --docker-username=x-access-token \
+            --docker-password="$REGISTRY_PULL_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Copy shared secrets from staging
+        if: inputs.copy_secrets != ''
+        env:
+          SECRETS: ${{ inputs.copy_secrets }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra names <<< "$SECRETS"
+          for s in "${names[@]}"; do
+            [ -n "$s" ] || continue
+            ./.review-ci/scripts/copy-secret.sh "$s" "$STAGING_NS" "$NS"
+          done
+
+      - name: Copy wildcard TLS secret
+        if: inputs.wildcard_secret != ''
+        env:
+          WILDCARD: ${{ inputs.wildcard_secret }}
+          SRC_NS: ${{ inputs.wildcard_source_ns }}
+        run: ./.review-ci/scripts/copy-secret.sh "$WILDCARD" "$SRC_NS" "$NS"
+
+      # Created once and kept: regenerating on every push would invalidate
+      # sessions mid-review.
+      - name: Generated per-env secret keys
+        if: inputs.generated_secret_keys != ''
+        env:
+          SECRET_NAME: ${{ inputs.generated_secret_name || format('{0}-secrets', inputs.app_name) }}
+          KEYS: ${{ inputs.generated_secret_keys }}
+        run: |
+          set -euo pipefail
+          if kubectl -n "$NS" get secret "$SECRET_NAME" >/dev/null 2>&1; then
+            echo "$SECRET_NAME already exists; keeping"
+            exit 0
+          fi
+          args=()
+          IFS=',' read -ra keys <<< "$KEYS"
+          for k in "${keys[@]}"; do
+            [ -n "$k" ] || continue
+            args+=("--from-literal=$k=$(openssl rand -hex 32)")
+          done
+          kubectl -n "$NS" create secret generic "$SECRET_NAME" "${args[@]}"
+
+      # Light tier: a per-PR database inside staging's CNPG cluster. The CR
+      # must live in the CLUSTER's namespace (CNPG resolves cluster.name in its
+      # own namespace) — which is why teardown is a script, not a namespace
+      # delete. Two names for one thing: a k8s object name is an RFC 1123
+      # subdomain (no underscores), a Postgres database conventionally has
+      # them; using one value for both fails at apply with a validation error.
+      - name: Per-PR database (shared-cnpg-database)
+        if: inputs.db_mode == 'shared-cnpg-database'
+        env:
+          PREFIX: ${{ inputs.db_name_prefix }}
+          CLUSTER_NAME: ${{ inputs.cnpg_cluster_name }}
+          OWNER: ${{ inputs.db_owner }}
+          DB_SECRET: ${{ inputs.db_secret_name }}
+        run: |
+          set -euo pipefail
+          DB_CR="${PREFIX}-pr${PR}"
+          DB="${PREFIX}_pr${PR}"
+          kubectl apply -f - <<EOF
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Database
+          metadata:
+            name: $DB_CR
+            namespace: $STAGING_NS
+          spec:
+            name: $DB
+            owner: $OWNER
+            cluster:
+              name: $CLUSTER_NAME
+            databaseReclaimPolicy: delete
+          EOF
+          for _ in $(seq 1 30); do
+            [ "$(kubectl -n "$STAGING_NS" get database "$DB_CR" -o jsonpath='{.status.applied}' 2>/dev/null)" = "true" ] && break
+            sleep 2
+          done
+          if [ "$(kubectl -n "$STAGING_NS" get database "$DB_CR" -o jsonpath='{.status.applied}' 2>/dev/null)" != "true" ]; then
+            echo "::error::Database $DB was not created:"
+            kubectl -n "$STAGING_NS" get database "$DB_CR" -o jsonpath='{.status.message}' 2>/dev/null || true
+            exit 1
+          fi
+          echo "database $DB ready"
+
+          if [ -n "$DB_SECRET" ]; then
+            # Synthesised rather than copied: same cluster and role as staging,
+            # different database. Direct, not through PgBouncer: auth_query
+            # would need per-database setup for one pod's worth of connections.
+            PW=$(kubectl -n "$STAGING_NS" get secret "$DB_SECRET" -o jsonpath='{.data.password}' | base64 -d)
+            DB_USER=$(kubectl -n "$STAGING_NS" get secret "$DB_SECRET" -o jsonpath='{.data.user}' | base64 -d)
+            DB_HOST="${CLUSTER_NAME}-rw.${STAGING_NS}.svc.cluster.local"
+            URI="postgresql://${DB_USER}:${PW}@${DB_HOST}:5432/${DB}"
+            kubectl -n "$NS" create secret generic "$DB_SECRET" \
+              --from-literal=uri="$URI" --from-literal=pooler-uri="$URI" \
+              --from-literal=dbname="$DB" --from-literal=host="$DB_HOST" \
+              --from-literal=port=5432 --from-literal=user="$DB_USER" \
+              --from-literal=username="$DB_USER" --from-literal=password="$PW" \
+              --dry-run=client -o yaml | kubectl apply -f -
+          fi
+
+      # Full tier, phase 1: the seed ConfigMap must exist BEFORE the CNPG
+      # cluster boots — postInitApplicationSQLRefs with a missing ref leaves
+      # the cluster hanging, not failing.
+      - name: Seed ConfigMap + CNPG cluster (sql-configmap)
+        if: inputs.db_mode == 'sql-configmap'
+        env:
+          SEED_PATH: ${{ inputs.seed_path }}
+          OVERLAY: ${{ inputs.overlay }}
+          CLUSTER_NAME: ${{ inputs.cnpg_cluster_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SEED_PATH" ]; then
+            kubectl -n "$NS" create configmap "${APP}-review-seed" \
+              --from-file="seed.sql=$SEED_PATH" \
+              --dry-run=client -o yaml | kubectl apply -f -
+          fi
+          if [ -f "$OVERLAY/cnpg-cluster.yaml" ] && [ -n "$CLUSTER_NAME" ]; then
+            kubectl -n "$NS" apply -f "$OVERLAY/cnpg-cluster.yaml"
+            kubectl -n "$NS" wait --for=condition=Ready "cluster/$CLUSTER_NAME" --timeout=300s
+          fi
+
+      - name: Write overlay params
+        uses: ./.review-ci/actions/write-params
+        with:
+          overlay: ${{ inputs.overlay }}
+          namespace: ${{ inputs.app_name }}-pr${{ github.event.pull_request.number }}
+          host: ${{ steps.slot.outputs.host }}
+          pr-number: ${{ github.event.pull_request.number }}
+          slot: ${{ steps.slot.outputs.slot }}
+          image: ${{ inputs.image }}
+          image-tag: ${{ inputs.image_tag }}
+          migrator-image: ${{ inputs.migrator_image }}
+
+      - name: Apply overlay
+        env:
+          OVERLAY: ${{ inputs.overlay }}
+        run: |
+          set -euo pipefail
+          kustomize build "$OVERLAY" | kubectl apply --server-side --force-conflicts -f -
+
+      # Hard-fail: a swallowed migration failure produces a green deploy of a
+      # broken schema, which is strictly worse than a red job.
+      - name: Run migrations
+        if: inputs.migrator_image != ''
+        env:
+          MIGRATOR: ${{ inputs.migrator_image }}
+          TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          JOB="migrate-$(echo "$TAG" | tr -c 'a-z0-9-' '-' | sed 's/-*$//' | cut -c1-40)"
+          kubectl -n "$NS" delete job "$JOB" --ignore-not-found
+          kubectl -n "$NS" create job "$JOB" --image="$MIGRATOR:$TAG"
+          if ! kubectl -n "$NS" wait --for=condition=complete "job/$JOB" --timeout=300s; then
+            echo "::error::migration job failed"
+            kubectl -n "$NS" logs "job/$JOB" --tail=100 || true
+            exit 1
+          fi
+
+      - name: Wait for rollout
+        env:
+          DEPLOY_NAME: ${{ inputs.deployment_name || inputs.app_name }}
+        run: kubectl -n "$NS" rollout status "deploy/$DEPLOY_NAME" --timeout=300s
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== pods ==="; kubectl -n "$NS" get pods -o wide || true
+          echo "=== describe ==="; kubectl -n "$NS" describe pods || true
+          echo "=== events ==="; kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40 || true
+          echo "=== logs ==="
+          for p in $(kubectl -n "$NS" get pods -o name 2>/dev/null); do
+            echo "--- $p"; kubectl -n "$NS" logs "$p" --tail=50 --all-containers || true
+          done
+
+      # Applied by the workflow, not the overlay, so `kustomize build` of the
+      # committed overlay stays auth-free. Mandatory for any app that ships an
+      # auth-bypass flag in its review overlay.
+      - name: Basic auth
+        if: inputs.basic_auth == 'true'
+        env:
+          HTPASSWD: ${{ secrets.BASIC_AUTH_HTPASSWD }}
+          INGRESS: ${{ inputs.ingress_name || inputs.app_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HTPASSWD" ]; then
+            echo "::error::basic_auth=true but the BASIC_AUTH_HTPASSWD secret is empty"; exit 1
+          fi
+          kubectl -n "$NS" create secret generic review-basic-auth \
+            --from-literal=auth="$HTPASSWD" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$NS" annotate ingress "$INGRESS" --overwrite \
+            nginx.ingress.kubernetes.io/auth-type=basic \
+            nginx.ingress.kubernetes.io/auth-secret=review-basic-auth \
+            nginx.ingress.kubernetes.io/auth-realm="review environment"
+
+      - name: Seed via app endpoint
+        if: inputs.db_mode == 'app-endpoint' && inputs.seed_command != ''
+        env:
+          SEED_COMMAND: ${{ inputs.seed_command }}
+          SEED_ENV: ${{ secrets.SEED_ENV }}
+          REVIEW_URL: ${{ steps.slot.outputs.url }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SEED_ENV" ]; then
+            set -a; . /dev/stdin <<< "$SEED_ENV"; set +a
+          fi
+          export NAMESPACE="$NS"
+          bash -c "$SEED_COMMAND"
+
+      - name: Smoke
+        env:
+          URL: ${{ steps.slot.outputs.url }}
+          BASIC_AUTH: ${{ inputs.basic_auth }}
+        run: |
+          set -euo pipefail
+          # 200/302 prove DNS, TLS, ingress and app. 401 is success only when
+          # basic auth is on — anywhere else it means the app is broken.
+          ok="200|302"
+          [ "$BASIC_AUTH" = "true" ] && ok="200|302|401"
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$URL/" || true)
+            if echo "$code" | grep -qE "^($ok)$"; then echo "$URL -> $code"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::$URL never responded acceptably (last: ${code:-none})"; exit 1
+
+      - name: PR comment
+        uses: ./.review-ci/actions/sticky-comment
+        with:
+          marker: review-env
+          pr-number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          body: |
+            ### Review environment (${{ inputs.tier }})
+
+            **${{ steps.slot.outputs.url }}**
+
+            Namespace `${{ steps.slot.outputs.namespace }}`, slot `${{ steps.slot.outputs.slot }}`, image `${{ inputs.image_tag }}`.
+            ${{ inputs.basic_auth == 'true' && 'Protected by basic auth (see the team credential note).' || '' }}
+            Close this PR to tear it down.
+            ${{ inputs.comment_extra }}

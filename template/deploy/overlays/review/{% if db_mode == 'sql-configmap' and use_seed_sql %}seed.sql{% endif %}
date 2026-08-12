@@ -1,0 +1,4 @@
+-- Review-environment seed data. Protected by _skip_if_exists: copier will
+-- never overwrite this file once you've written real fixtures.
+-- Keep it aligned with what your E2E specs assert against.
+SELECT 1;

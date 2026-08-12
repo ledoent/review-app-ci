@@ -1,0 +1,10 @@
+app_name: minimal
+github_org: ledoent
+registry: ghcr
+cluster_auth: kubeconfig
+review_trigger: label
+review_tier: full
+db_mode: none
+manage_deploy_workflow: true
+scaffold_k8s_manifests: true
+slot_count: "2"

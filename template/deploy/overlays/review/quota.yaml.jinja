@@ -1,0 +1,33 @@
+# Guard rails for one review environment. The PVC count is a tier tripwire:
+# the light tier owns no storage, so a PVC appearing means the wrong overlay
+# was applied.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: review-quota
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "2"
+    limits.memory: 4Gi
+    pods: "10"
+{%- if review_tier == 'light' %}
+    persistentvolumeclaims: "0"
+{%- else %}
+    persistentvolumeclaims: "2"
+{%- endif %}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: review-limits
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 25m
+        memory: 64Mi

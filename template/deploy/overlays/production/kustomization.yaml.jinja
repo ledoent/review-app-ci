@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Hand-owned after the first stamp (_skip_if_exists) — copier never overwrites.
+namespace: {{ app_name }}-production
+
+resources:
+  - ../../base
+
+images:
+  - name: {{ image_ref }}
+    newTag: latest  # overwritten by CI

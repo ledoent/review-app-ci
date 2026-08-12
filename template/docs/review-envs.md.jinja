@@ -1,0 +1,77 @@
+# Review environments — {{ app_name }}
+
+Stamped by [ledoent/review-app-ci](https://github.com/ledoent/review-app-ci)
+(`copier update` to pull template changes; shared-logic fixes arrive on their
+own when the `v1` tag moves).
+
+## How it works
+
+{% if review_trigger == 'label' -%}
+Label a PR `{{ review_label }}` to get an environment; remove the label or
+close the PR to tear it down. Label-gated because an environment nobody asked
+for is one nobody tears down — and slots are a finite pool.
+{%- else -%}
+Every same-repo PR gets an environment on open/push; closing the PR tears it
+down.
+{%- endif %}
+
+- Namespace: `{{ app_name }}-pr<N>` (PR number, never the branch name)
+- Hostname: one of {{ slot_count }} pre-registered slots
+  `{{ app_name }}-review<1..{{ slot_count }}>.{{ review_domain }}` — claimed
+  atomically per PR, lowest free wins, released on teardown. See
+  `deploy/overlays/review/SLOTS.md` before changing the pool size.
+- Tier: **{{ review_tier }}**{% if review_tier == 'light' %} (backend borrowed
+  from `{{ shared_backend_namespace }}` — it must be up){% endif %}
+- TTL: `vars.REVIEW_TTL_HOURS` (default 48h) — the nightly sweep reaps older
+  environments even when the PR is open; redeploy to rebuild.
+- Mail: sunk to Mailpit in-cluster. Review environments can never send real
+  email.
+
+## Required repo secrets
+
+| Secret | Needed for |
+|---|---|
+{%- if cluster_auth == 'kubeconfig' %}
+| `KUBE_CONFIG` | base64 kubeconfig for the deploy identity |
+{%- endif %}
+{%- if registry == 'zot' %}
+| `ZOT_USERNAME` / `ZOT_PASSWORD` | image push/pull to {{ zot_host }} |
+{%- endif %}
+{%- if registry == 'ghcr' %}
+| `REGISTRY_PULL_TOKEN` | read:packages token for the in-cluster `registry-pull` secret |
+{%- endif %}
+{%- if manage_deploy_workflow %}
+| `APP_ENV_STAGING` / `APP_ENV_PRODUCTION` | JSON object `{"KEY":"value",...}` materialized as `{{ app_name }}-secrets` in that env's namespace |
+{%- endif %}
+{%- if basic_auth %}
+| `BASIC_AUTH_HTPASSWD` | htpasswd line for the review ingress gate |
+| `BASIC_AUTH_CREDS` | `user:pass` used by e2e/Lighthouse against the gate |
+{%- endif %}
+{%- if seed_command %}
+| `SEED_ENV` | dotenv blob exported before `{{ seed_command }}` |
+{%- endif %}
+| `E2E_ENV` | optional dotenv blob for the Playwright run |
+
+Repo variables: `REVIEW_TTL_HOURS` (optional, default 48).
+
+{% if cluster_auth == 'gke-wif' -%}
+Cluster/registry auth is keyless (Workload Identity Federation via
+`{{ gcp_service_account }}`) — no long-lived secrets.
+{%- endif %}
+
+## Secrets model
+
+Staging is the seeding point: `deploy-env.yml` materializes `APP_ENV_STAGING`
+into `{{ app_name }}-secrets` there. Review environments **copy** named
+secrets from staging ({{ shared_secrets_to_copy or "none configured" }}) —
+never SMTP credentials (mail is sunk), never fresh `--from-literal` blocks in
+workflows.
+
+## Runbook
+
+- **All slots taken**: the deploy fails listing holders. Close a stale PR or
+  remove its label; the claim also self-heals leases whose PR already closed.
+- **Manual sweep**: Actions → Review sweep → run with `dry_run` to preview.
+- **Orphan check**: `kubectl get ns | grep {{ app_name }}-pr`,
+  `kubectl get lease -n review-slots -l review.ledoent.dev/app={{ app_name }}`.
+- **Rebuild after TTL reap**: push to the PR{% if review_trigger == 'label' %} or re-add the label{% endif %}.

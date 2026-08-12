@@ -1,0 +1,112 @@
+name: Template CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck scripts/*.sh
+
+  lint-reusable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint (reusable workflows)
+        run: |
+          set -euo pipefail
+          bash <(curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
+          # github.job_workflow_sha is real for reusable workflows; actionlint's
+          # schema lags behind.
+          ./actionlint -ignore 'property "job_workflow_sha" is not defined'
+
+  render:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [bimble, duropc, cadplm, minimal, zot]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          pipx install copier
+          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.6.0/kustomize_v5.6.0_linux_amd64.tar.gz" | tar xz
+          sudo install kustomize /usr/local/bin/
+          bash <(curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
+          sudo install actionlint /usr/local/bin/
+
+      - name: Render
+        run: |
+          set -euo pipefail
+          copier copy --trust --defaults --force \
+            --data-file "tests/answers/${{ matrix.fixture }}.yml" . /tmp/render
+
+      - name: actionlint rendered callers
+        run: cd /tmp/render && git init -q . && actionlint
+
+      - name: kustomize build review overlay (at rest)
+        run: kustomize build /tmp/render/deploy/overlays/review > /dev/null
+
+      - name: Simulate CI param rewrite, build again
+        run: |
+          set -euo pipefail
+          OVERLAY=/tmp/render/deploy/overlays/review
+          cat > "$OVERLAY/params.env" <<'EOF'
+          REVIEW_HOST=test-review2.example.com
+          REVIEW_URL=https://test-review2.example.com
+          PR_NUMBER=999
+          REVIEW_SLOT=2
+          EOF
+          cd "$OVERLAY"
+          kustomize edit set namespace test-pr999
+          kustomize build . | grep -q "host: test-review2.example.com" \
+            || { echo "::error::REVIEW_HOST replacement did not reach the ingress"; exit 1; }
+
+      - name: Policy greps
+        run: |
+          set -euo pipefail
+          # Review ingresses must never carry a cluster-issuer: cert-manager
+          # would seize the shared wildcard secret and reissue it.
+          if grep -rn "cluster-issuer" /tmp/render/deploy/overlays/review/; then
+            echo "::error::review overlay must not set cert-manager.io/cluster-issuer"; exit 1
+          fi
+          # SMTP credentials must never be copied into review namespaces.
+          if grep -in "smtp" /tmp/render/.github/workflows/review-env.yml | grep -iv "sink"; then
+            echo "::error::SMTP secrets in copy_secrets — mail must go to the sink"; exit 1
+          fi
+          # Every reusable-workflow reference pins the v1 major.
+          if grep -rhoE "uses: ledoent/review-app-ci[^@]*@[^ ]+" /tmp/render/.github/workflows/ | grep -v "@v1$"; then
+            echo "::error::caller pins a ref other than @v1"; exit 1
+          fi
+          # An auth-bypass flag in the overlay requires basic_auth.
+          if grep -rqE "TEST_MODE|ALLOW_TEST_MODE" /tmp/render/deploy/overlays/review/ \
+             && ! grep -q 'basic_auth: "true"' /tmp/render/.github/workflows/review-env.yml; then
+            echo "::error::auth-bypass flag without basic_auth=true"; exit 1
+          fi
+
+      - name: copier update idempotence
+        run: |
+          set -euo pipefail
+          cd /tmp/render
+          git init -q . 2>/dev/null || true
+          git add -A && git -c user.email=ci@ledoweb.com -c user.name=ci commit -qm render
+          copier copy --trust --defaults --force \
+            --data-file "$GITHUB_WORKSPACE/tests/answers/${{ matrix.fixture }}.yml" \
+            "$GITHUB_WORKSPACE" .
+          if ! git diff --quiet; then
+            echo "::error::re-render with identical answers produced a diff:"
+            git diff | head -50
+            exit 1
+          fi

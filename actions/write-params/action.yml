@@ -1,0 +1,73 @@
+name: Write review overlay params
+description: >-
+  Point a review overlay at this PR's namespace, host and image — entirely with
+  kustomize-native edits (params.env + `kustomize edit`), never sed on
+  manifests, so `kustomize build` of the committed overlay stays valid at rest.
+
+inputs:
+  overlay:
+    description: Path to the review overlay directory
+    required: true
+  namespace:
+    description: Review namespace (<app>-pr<N>)
+    required: true
+  host:
+    description: Claimed slot hostname
+    required: true
+  pr-number:
+    description: PR number
+    required: true
+  slot:
+    description: Claimed slot index
+    required: true
+  image:
+    description: Untagged image reference to retag
+    required: true
+  image-tag:
+    description: Immutable per-push tag
+    required: true
+  migrator-image:
+    description: Optional second image (migrator) to retag
+    required: false
+    default: ""
+  migrator-tag:
+    description: Tag for the migrator image (defaults to image-tag)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Write params.env and set namespace/image
+      shell: bash
+      env:
+        OVERLAY: ${{ inputs.overlay }}
+        NS: ${{ inputs.namespace }}
+        HOST: ${{ inputs.host }}
+        PR: ${{ inputs.pr-number }}
+        SLOT: ${{ inputs.slot }}
+        IMAGE: ${{ inputs.image }}
+        TAG: ${{ inputs.image-tag }}
+        MIGRATOR: ${{ inputs.migrator-image }}
+        MIGRATOR_TAG: ${{ inputs.migrator-tag }}
+      run: |
+        set -euo pipefail
+        test -f "$OVERLAY/kustomization.yaml" || { echo "::error::$OVERLAY has no kustomization.yaml"; exit 1; }
+        # The overlay's committed params.env holds defaults; this overwrite is
+        # the ONLY parameterization step. The generated review-params ConfigMap
+        # feeds app env via envFrom, and kustomize `replacements` propagate
+        # REVIEW_HOST into the ingress host/tls fields.
+        cat > "$OVERLAY/params.env" <<EOF
+        REVIEW_HOST=$HOST
+        REVIEW_URL=https://$HOST
+        PR_NUMBER=$PR
+        REVIEW_SLOT=$SLOT
+        EOF
+        cd "$OVERLAY"
+        kustomize edit set namespace "$NS"
+        kustomize edit set image "$IMAGE=$IMAGE:$TAG"
+        if [ -n "$MIGRATOR" ]; then
+          kustomize edit set image "$MIGRATOR=$MIGRATOR:${MIGRATOR_TAG:-$TAG}"
+        fi
+        kustomize build . > /dev/null   # fail here, not at apply time
+        echo "params written: ns=$NS host=$HOST tag=$TAG"

@@ -1,0 +1,4 @@
+# Custom self-hosted runner labels used by ledoent/measinst workflows.
+self-hosted-runner:
+  labels:
+    - hetzner-k3s-ledoent

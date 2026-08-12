@@ -1,0 +1,73 @@
+name: Registry login
+description: >-
+  Log docker in to the app's image registry: GHCR (GITHUB_TOKEN), Google
+  Artifact Registry (keyless, expects google-github-actions/auth already ran —
+  setup-deploy with cluster-auth=gke-wif does), or Zot (username/password).
+
+inputs:
+  registry:
+    description: "ghcr | gar | zot"
+    required: true
+  gar-location:
+    description: Artifact Registry location, e.g. us-east1 (registry=gar)
+    required: false
+    default: ""
+  zot-host:
+    description: Zot registry host (registry=zot)
+    required: false
+    default: "registry.hz.ledoweb.com"
+  username:
+    description: Registry username (ghcr -> github.actor; zot -> ZOT_USERNAME)
+    required: false
+    default: ""
+  password:
+    description: Registry password/token (ghcr -> GITHUB_TOKEN; zot -> ZOT_PASSWORD)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Validate registry
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+      run: |
+        case "$REGISTRY" in
+          ghcr|gar|zot) ;;
+          *) echo "::error::registry must be ghcr, gar or zot, got '$REGISTRY'"; exit 1 ;;
+        esac
+
+    - name: Login (ghcr)
+      if: inputs.registry == 'ghcr'
+      shell: bash
+      env:
+        USERNAME: ${{ inputs.username }}
+        PASSWORD: ${{ inputs.password }}
+      run: |
+        set -euo pipefail
+        # Token via stdin, never on the command line.
+        docker login ghcr.io -u "$USERNAME" --password-stdin <<< "$PASSWORD"
+
+    - name: Login (gar)
+      if: inputs.registry == 'gar'
+      shell: bash
+      env:
+        GAR_LOCATION: ${{ inputs.gar-location }}
+      run: |
+        set -euo pipefail
+        if [ -z "$GAR_LOCATION" ]; then
+          echo "::error::gar-location is required for registry=gar"; exit 1
+        fi
+        gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev" --quiet
+
+    - name: Login (zot)
+      if: inputs.registry == 'zot'
+      shell: bash
+      env:
+        ZOT_HOST: ${{ inputs.zot-host }}
+        USERNAME: ${{ inputs.username }}
+        PASSWORD: ${{ inputs.password }}
+      run: |
+        set -euo pipefail
+        docker login "$ZOT_HOST" -u "$USERNAME" --password-stdin <<< "$PASSWORD"

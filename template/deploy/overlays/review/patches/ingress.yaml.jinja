@@ -1,0 +1,21 @@
+# The hostname itself is set by the `replacements` block in kustomization.yaml
+# (sourced from params.env); this patch owns TLS and annotations.
+#
+# Deliberately NO cert-manager.io/cluster-issuer annotation: review hosts ride
+# the shared wildcard secret copied in by the deploy workflow. Annotating this
+# ingress would make cert-manager seize the shared secret and reissue it for
+# one ephemeral host, breaking every other consumer at once.
+#
+# Deliberately NO rate-limit annotation: Playwright and Lighthouse trip it.
+# Basic auth (when enabled) is annotated by the deploy workflow, not here, so
+# this overlay stays auth-free at rest.
+- op: add
+  path: /spec/tls
+  value:
+    - hosts:
+        - PLACEHOLDER  # rewritten by the replacements block
+      secretName: wildcard-tls
+- op: add
+  path: /metadata/annotations/nginx.ingress.kubernetes.io~1configuration-snippet
+  value: |
+    more_set_headers "X-Robots-Tag: noindex, nofollow";

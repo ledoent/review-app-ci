@@ -1,0 +1,124 @@
+name: Setup deploy tools
+description: >-
+  Install pinned kubectl + kustomize and authenticate to the cluster, via a
+  base64 kubeconfig secret (Hetzner k3s) or keyless GKE Workload Identity
+  Federation (meas-apps).
+
+inputs:
+  cluster-auth:
+    description: "kubeconfig | gke-wif"
+    required: true
+  kube-config:
+    description: Base64-encoded kubeconfig (cluster-auth=kubeconfig)
+    required: false
+    default: ""
+  wif-provider:
+    description: Workload Identity provider resource name (cluster-auth=gke-wif)
+    required: false
+    default: ""
+  gcp-service-account:
+    description: Service account email (cluster-auth=gke-wif)
+    required: false
+    default: ""
+  gcp-project:
+    description: GCP project id (cluster-auth=gke-wif)
+    required: false
+    default: ""
+  gke-cluster:
+    description: GKE cluster name (cluster-auth=gke-wif)
+    required: false
+    default: ""
+  gke-zone:
+    description: GKE cluster zone (cluster-auth=gke-wif)
+    required: false
+    default: ""
+  kubectl-version:
+    description: Pinned kubectl version
+    required: false
+    default: "1.31.0"
+  kustomize-version:
+    description: Pinned kustomize version
+    required: false
+    default: "5.6.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Validate cluster-auth
+      shell: bash
+      env:
+        CLUSTER_AUTH: ${{ inputs.cluster-auth }}
+      run: |
+        case "$CLUSTER_AUTH" in
+          kubeconfig|gke-wif) ;;
+          *) echo "::error::cluster-auth must be 'kubeconfig' or 'gke-wif', got '$CLUSTER_AUTH'"; exit 1 ;;
+        esac
+
+    - name: Install kubectl + kustomize
+      shell: bash
+      env:
+        KUBECTL_VERSION: ${{ inputs.kubectl-version }}
+        KUSTOMIZE_VERSION: ${{ inputs.kustomize-version }}
+      run: |
+        set -euo pipefail
+        # sudo is absent inside some ARC runner containers; fall back to a
+        # user-writable bin dir already on PATH via GITHUB_PATH.
+        BIN_DIR="/usr/local/bin"
+        SUDO="sudo"
+        if ! command -v sudo >/dev/null; then SUDO=""; fi
+        if [ -z "$SUDO" ] && [ ! -w "$BIN_DIR" ]; then
+          BIN_DIR="$HOME/.local/bin"; mkdir -p "$BIN_DIR"; echo "$BIN_DIR" >> "$GITHUB_PATH"
+        fi
+        curl -sLO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+        $SUDO install kubectl "$BIN_DIR/"
+        curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz
+        $SUDO install kustomize "$BIN_DIR/"
+        rm -f kubectl kustomize
+
+    - name: Configure kubeconfig auth
+      if: inputs.cluster-auth == 'kubeconfig'
+      shell: bash
+      env:
+        KUBE_CONFIG_B64: ${{ inputs.kube-config }}
+      run: |
+        set -euo pipefail
+        if [ -z "$KUBE_CONFIG_B64" ]; then
+          echo "::error::kube-config input is empty. Verify the KUBE_CONFIG secret is set and visible to this repository."
+          exit 1
+        fi
+        mkdir -p "$HOME/.kube"
+        echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+        chmod 600 "$HOME/.kube/config"
+        # Export KUBECONFIG for all subsequent steps so kubectl uses this file
+        # instead of the in-cluster service account (ARC runner pods mount one
+        # by default, and it points at the wrong identity).
+        echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+        KUBECONFIG="$HOME/.kube/config" kubectl config current-context
+        KUBECONFIG="$HOME/.kube/config" kubectl auth whoami 2>/dev/null || \
+          KUBECONFIG="$HOME/.kube/config" kubectl config view --minify -o jsonpath='{.users[0].name}{"\n"}'
+
+    - name: Authenticate to GCP (WIF)
+      if: inputs.cluster-auth == 'gke-wif'
+      uses: google-github-actions/auth@v2
+      with:
+        project_id: ${{ inputs.gcp-project }}
+        workload_identity_provider: ${{ inputs.wif-provider }}
+        service_account: ${{ inputs.gcp-service-account }}
+
+    - name: Setup gcloud + GKE credentials
+      if: inputs.cluster-auth == 'gke-wif'
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        install_components: gke-gcloud-auth-plugin
+
+    - name: Get GKE credentials
+      if: inputs.cluster-auth == 'gke-wif'
+      shell: bash
+      env:
+        GKE_CLUSTER: ${{ inputs.gke-cluster }}
+        GKE_ZONE: ${{ inputs.gke-zone }}
+        GCP_PROJECT: ${{ inputs.gcp-project }}
+      run: |
+        set -euo pipefail
+        gcloud container clusters get-credentials "$GKE_CLUSTER" --zone "$GKE_ZONE" --project "$GCP_PROJECT"
+        kubectl config current-context

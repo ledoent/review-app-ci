@@ -1,0 +1,32 @@
+app_name: duropc
+repo_slug: duropc
+github_org: measinst
+registry: gar
+gar_project: meas-inst-prod
+gar_location: us-east1
+gar_repository: duropc
+cluster_auth: gke-wif
+wif_provider: projects/588570914403/locations/global/workloadIdentityPools/github/providers/github-oidc
+gcp_service_account: duropc-ci@meas-inst-prod.iam.gserviceaccount.com
+gcp_project: meas-inst-prod
+gke_cluster: meas-apps
+gke_zone: us-east1-b
+build_context: storefront
+review_trigger: label
+review_label: review
+review_tier: light
+shared_backend_namespace: duropc-staging
+# Real duropc answers use base_component: storefront; the fixture uses '.' so
+# the scaffolded base satisfies the kustomize-build validation.
+base_component: "."
+staging_deployments: "saleor-api,typesense"
+shared_secrets_to_copy: "storefront-secrets,typesense-secrets,aws-s3-credentials"
+db_mode: shared-cnpg-database
+cnpg_cluster_name: saleor-db
+db_name_prefix: payload
+db_secret_name: payload-db-app
+host_in_build: true
+basic_auth: false
+manage_deploy_workflow: false
+scaffold_k8s_manifests: true
+slot_count: "4"

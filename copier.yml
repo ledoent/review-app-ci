@@ -1,0 +1,255 @@
+# Copier template for GitLab-Auto-DevOps-style review environments on
+# GitHub Actions + kustomize. Stamps thin caller workflows that pin the
+# reusable workflows in this same repo (@v1), plus a review overlay skeleton.
+#
+#   copier copy --trust gh:ledoent/review-app-ci .
+#   copier update        # after the first stamp; 3-way merges template changes
+#
+# Answers land in .copier-answers.yml (never edit it by hand).
+
+_subdirectory: template
+_templates_suffix: .jinja
+_min_copier_version: "9.0.0"
+_skip_if_exists:
+  - deploy/base/**
+  - deploy/overlays/staging/**
+  - deploy/overlays/production/**
+  - deploy/overlays/review/seed.sql
+_message_after_copy: |
+  Stamped. Now:
+    1. Set the repo secrets/variables listed in docs/review-envs.md
+       (rendered for registry={{ registry }} / cluster_auth={{ cluster_auth }}).
+    2. Register the slot hostnames ({{ app_name }}-review1..{{ slot_count }}.{{ review_domain }})
+       in any OAuth clients the app uses, and record them in
+       deploy/overlays/review/SLOTS.md.
+    3. Open a PR and label/push to see the review environment.
+
+app_name:
+  type: str
+  help: Short app slug (namespace prefix, slot pool key, deployment name)
+
+github_org:
+  type: str
+  default: ledoent
+  choices: [ledoent, measinst]
+
+review_domain:
+  type: str
+  default: "{% if github_org == 'measinst' %}mi.ledoweb.com{% else %}hz.ledoweb.com{% endif %}"
+  help: Wildcard-DNS domain review hostnames live under
+
+runner:
+  type: str
+  default: "{% if github_org == 'measinst' %}ubuntu-latest{% else %}hetzner-k3s-ledoent{% endif %}"
+  help: Runner label for deploy jobs
+
+registry:
+  type: str
+  default: "{% if github_org == 'measinst' %}gar{% else %}ghcr{% endif %}"
+  choices: [ghcr, gar, zot]
+
+gar_project:
+  type: str
+  default: meas-inst-prod
+  when: "{{ registry == 'gar' }}"
+
+gar_location:
+  type: str
+  default: us-east1
+  when: "{{ registry == 'gar' }}"
+
+gar_repository:
+  type: str
+  default: "{{ app_name }}"
+  when: "{{ registry == 'gar' }}"
+
+zot_host:
+  type: str
+  default: registry.hz.ledoweb.com
+  when: "{{ registry == 'zot' }}"
+
+cluster_auth:
+  type: str
+  default: "{% if registry == 'gar' %}gke-wif{% else %}kubeconfig{% endif %}"
+  choices: [kubeconfig, gke-wif]
+
+wif_provider:
+  type: str
+  default: projects/588570914403/locations/global/workloadIdentityPools/github/providers/github-oidc
+  when: "{{ cluster_auth == 'gke-wif' }}"
+
+gcp_service_account:
+  type: str
+  default: "{{ app_name }}-ci@{{ gar_project | default('') }}.iam.gserviceaccount.com"
+  when: "{{ cluster_auth == 'gke-wif' }}"
+
+gcp_project:
+  type: str
+  default: "{{ gar_project | default('') }}"
+  when: "{{ cluster_auth == 'gke-wif' }}"
+
+gke_cluster:
+  type: str
+  default: meas-apps
+  when: "{{ cluster_auth == 'gke-wif' }}"
+
+gke_zone:
+  type: str
+  default: us-east1-b
+  when: "{{ cluster_auth == 'gke-wif' }}"
+
+repo_slug:
+  type: str
+  default: "{{ app_name }}"
+  help: GitHub repository name (may differ from app_name, e.g. bimble-platform)
+
+image_ref:
+  type: str
+  default: "{% if registry == 'ghcr' %}ghcr.io/{{ github_org }}/{{ repo_slug }}{% elif registry == 'gar' %}{{ gar_location }}-docker.pkg.dev/{{ gar_project }}/{{ gar_repository }}/{{ app_name }}{% else %}{{ zot_host }}/{{ github_org }}/{{ app_name }}{% endif %}"
+  help: Untagged image reference CI pushes and overlays consume
+
+build_context:
+  type: str
+  default: "."
+  help: Docker build context (duropc uses storefront/)
+
+dockerfile:
+  type: str
+  default: "{% if build_context == '.' %}Dockerfile{% else %}{{ build_context }}/Dockerfile{% endif %}"
+
+review_trigger:
+  type: str
+  default: label
+  choices: [auto, label]
+  help: >-
+    label-gated per duropc: "an environment nobody asked for is one nobody
+    tears down" — and slots are a finite pool. Pick auto for GitLab-parity
+    (every PR gets an env) on low-traffic repos.
+
+review_label:
+  type: str
+  default: review
+  when: "{{ review_trigger == 'label' }}"
+
+review_tier:
+  type: str
+  default: full
+  choices: [full, light]
+  help: >-
+    light deploys only this app and borrows the backend (Saleor, Typesense,
+    ...) from a shared staging namespace; full is self-contained per PR.
+
+shared_backend_namespace:
+  type: str
+  default: "{{ app_name }}-staging"
+  when: "{{ review_tier == 'light' }}"
+
+base_component:
+  type: str
+  default: "."
+  help: "deploy/base subdirectory holding this app's own manifests (duropc: storefront); '.' = the whole base"
+  when: "{{ review_tier == 'light' }}"
+
+staging_deployments:
+  type: str
+  default: ""
+  help: Comma list of deployments that must exist in staging (light-tier preflight)
+  when: "{{ review_tier == 'light' }}"
+
+shared_secrets_to_copy:
+  type: str
+  default: ""
+  help: Comma list of secret names copied from staging into each review namespace
+
+db_mode:
+  type: str
+  default: "{% if review_tier == 'light' %}shared-cnpg-database{% else %}sql-configmap{% endif %}"
+  choices: [none, sql-configmap, shared-cnpg-database, app-endpoint, restore-prod]
+
+cnpg_cluster_name:
+  type: str
+  default: "{{ app_name }}-db"
+  when: "{{ db_mode in ['sql-configmap', 'shared-cnpg-database'] }}"
+
+db_name_prefix:
+  type: str
+  default: "{{ app_name | replace('-', '_') }}"
+  help: "CR = <prefix>-pr<N> (hyphens), database = <prefix>_pr<N> (underscores)"
+  when: "{{ db_mode == 'shared-cnpg-database' }}"
+
+db_secret_name:
+  type: str
+  default: ""
+  help: Staging secret whose user/password seed the per-PR database URI secret
+  when: "{{ db_mode == 'shared-cnpg-database' }}"
+
+use_seed_sql:
+  type: bool
+  default: true
+  when: "{{ db_mode == 'sql-configmap' }}"
+
+seed_command:
+  type: str
+  default: ""
+  help: Repo script run after rollout with REVIEW_URL env (db_mode=app-endpoint)
+  when: "{{ db_mode == 'app-endpoint' }}"
+
+generated_secret_keys:
+  type: str
+  default: ""
+  help: "Comma list of per-env generated secret keys (e.g. BETTER_AUTH_SECRET)"
+
+host_in_build:
+  type: bool
+  default: false
+  help: >-
+    true when the public URL is baked into the image at build time
+    (NEXT_PUBLIC_SITE_URL and friends) — the slot is then claimed BEFORE the
+    build via review-claim.yml.
+
+basic_auth:
+  type: bool
+  default: false
+  help: >-
+    Ingress basic auth on review envs. MANDATORY when the review overlay sets
+    any auth-bypass flag (TEST_MODE etc.) — template CI enforces the pairing.
+
+e2e_command:
+  type: str
+  default: ""
+  help: 'Playwright command run against the review URL ("" = skip e2e)'
+
+e2e_container:
+  type: str
+  default: mcr.microsoft.com/playwright:v1.58.2-noble
+  when: "{{ e2e_command != '' }}"
+
+lighthouse_paths:
+  type: str
+  default: ""
+  help: 'Comma list of paths audited by Lighthouse ("" = skip)'
+
+manage_deploy_workflow:
+  type: bool
+  default: true
+  help: false keeps the repo's own build/staging/production pipeline (duropc)
+
+scaffold_k8s_manifests:
+  type: bool
+  default: false
+  help: true stamps a minimal deploy/base skeleton (new apps only; skip_if_exists protects existing repos either way)
+
+staging_host:
+  type: str
+  default: "{{ app_name }}-staging.{{ review_domain }}"
+  when: "{{ manage_deploy_workflow }}"
+
+production_host:
+  type: str
+  default: "{{ app_name }}.{{ review_domain }}"
+  when: "{{ manage_deploy_workflow }}"
+
+slot_count:
+  type: str
+  default: "4"
+  help: Size of the pre-registered hostname pool (raising it means registering new OAuth redirect URIs first)

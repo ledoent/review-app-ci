@@ -1,0 +1,98 @@
+name: Review slot claim (reusable)
+
+# Claims the hostname slot BEFORE the caller's build job, for apps that bake
+# the public URL into the image at build time (NEXT_PUBLIC_SITE_URL and
+# friends). Apps that don't need the host at build time skip this workflow —
+# review-deploy.yml claims on its own when no slot is passed in.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      base_domain:
+        type: string
+        default: hz.ledoweb.com
+      slot_count:
+        type: string
+        default: "4"
+      cluster_auth:
+        type: string
+        default: kubeconfig
+      wif_provider:
+        type: string
+        default: ""
+      gcp_service_account:
+        type: string
+        default: ""
+      gcp_project:
+        type: string
+        default: ""
+      gke_cluster:
+        type: string
+        default: ""
+      gke_zone:
+        type: string
+        default: ""
+      db_name_prefix:
+        description: Enables reaping a closed holder's Database CR during the on-exhaustion orphan check
+        type: string
+        default: ""
+      staging_namespace:
+        type: string
+        default: ""
+      runs_on:
+        type: string
+        default: ubuntu-latest
+    secrets:
+      KUBE_CONFIG:
+        required: false
+    outputs:
+      slot:
+        value: ${{ jobs.claim.outputs.slot }}
+      host:
+        value: ${{ jobs.claim.outputs.host }}
+      url:
+        value: ${{ jobs.claim.outputs.url }}
+      namespace:
+        value: ${{ jobs.claim.outputs.namespace }}
+
+jobs:
+  claim:
+    runs-on: ${{ inputs.runs_on }}
+    outputs:
+      slot: ${{ steps.slot.outputs.slot }}
+      host: ${{ steps.slot.outputs.host }}
+      url: ${{ steps.slot.outputs.url }}
+      namespace: ${{ steps.slot.outputs.namespace }}
+    steps:
+      - name: Checkout review-app-ci
+        uses: actions/checkout@v4
+        with:
+          repository: ledoent/review-app-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .review-ci
+
+      - name: Setup deploy tools
+        uses: ./.review-ci/actions/setup-deploy
+        with:
+          cluster-auth: ${{ inputs.cluster_auth }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          wif-provider: ${{ inputs.wif_provider }}
+          gcp-service-account: ${{ inputs.gcp_service_account }}
+          gcp-project: ${{ inputs.gcp_project }}
+          gke-cluster: ${{ inputs.gke_cluster }}
+          gke-zone: ${{ inputs.gke_zone }}
+
+      - name: Claim slot
+        id: slot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP: ${{ inputs.app_name }}
+          PR: ${{ github.event.pull_request.number }}
+          SLOT_COUNT: ${{ inputs.slot_count }}
+          DOMAIN: ${{ inputs.base_domain }}
+          STAGING_NS: ${{ inputs.staging_namespace }}
+          DB_CR_PREFIX: ${{ inputs.db_name_prefix && format('{0}-pr', inputs.db_name_prefix) || '' }}
+        run: ./.review-ci/scripts/claim-slot.sh "$APP" "$PR" "$SLOT_COUNT" "$DOMAIN"

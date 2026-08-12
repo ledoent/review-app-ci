@@ -1,0 +1,48 @@
+# MANAGED BY ledoent/review-app-ci — edit answers via `copier update`, not here.
+#
+# Sweep minute is derived from the app name: it spreads apps' sweeps across
+# the hour while keeping `copier update` idempotent (a random value would
+# re-render differently every run and defeat the empty-diff check).
+name: Review sweep
+on:
+  schedule:
+    - cron: "{{ (app_name | length * 7) % 50 + 5 }} 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be deleted without deleting it
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+jobs:
+  sweep:
+    uses: ledoent/review-app-ci/.github/workflows/review-sweep.yml@v1
+    with:
+      app_name: {{ app_name }}
+{%- if db_mode == 'shared-cnpg-database' %}
+      db_name_prefix: {{ db_name_prefix | replace('_', '-') }}
+      staging_namespace: {{ shared_backend_namespace }}
+{%- endif %}
+{%- if review_trigger == 'label' %}
+      review_labels: "{{ review_label }}"
+{%- endif %}
+      ttl_hours: {% raw %}${{ vars.REVIEW_TTL_HOURS || '48' }}{% endraw %}
+      # Scheduled runs always delete; only a manual run can ask to be shown
+      # the list first.
+      dry_run: {% raw %}${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}{% endraw %}
+      cluster_auth: {{ cluster_auth }}
+{%- if cluster_auth == 'gke-wif' %}
+      wif_provider: {{ wif_provider }}
+      gcp_service_account: {{ gcp_service_account }}
+      gcp_project: {{ gcp_project }}
+      gke_cluster: {{ gke_cluster }}
+      gke_zone: {{ gke_zone }}
+{%- endif %}
+      runs_on: {{ runner }}
+    secrets:
+      KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}

@@ -1,0 +1,18 @@
+# Review hostname slots — {{ app_name }}
+
+Fixed pool of pre-registered hostnames. The runtime source of truth is
+`kubectl get lease -n review-slots -l review.ledoent.dev/app={{ app_name }}`;
+THIS file is the human record that keeps "slot count" and "what's registered
+in each OAuth client" honest. **Raising the slot count in
+`.copier-answers.yml` without registering the new hostnames first is the
+failure mode this file exists to catch in review.**
+
+| slot | hostname | OAuth clients registered | registered on |
+|---|---|---|---|
+{%- for i in range(1, slot_count | int + 1) %}
+| {{ i }} | `{{ app_name }}-review{{ i }}.{{ review_domain }}` | _none yet — register before first use if the app does its own OAuth_ | |
+{%- endfor %}
+
+Redirect URIs to register per host (adjust to the app's auth routes), e.g.:
+
+- `https://{{ app_name }}-review1.{{ review_domain }}/api/auth/callback/google`

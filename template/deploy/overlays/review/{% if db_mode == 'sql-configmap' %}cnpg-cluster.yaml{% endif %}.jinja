@@ -1,0 +1,29 @@
+# Per-PR CNPG cluster, right-sized for one reviewer. No backups: the data is
+# a seed fixture and dies with the PR.
+#
+# The deploy workflow applies this file FIRST (after creating the seed
+# ConfigMap — postInitApplicationSQLRefs with a missing ref leaves the cluster
+# hanging, not failing), waits for Ready, then applies the whole overlay,
+# which includes it again idempotently.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ cnpg_cluster_name }}
+spec:
+  instances: 1
+  storage:
+    size: 1Gi
+  postgresql:
+    parameters:
+      shared_buffers: 32MB
+      max_connections: "20"
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+{%- if use_seed_sql %}
+      postInitApplicationSQLRefs:
+        configMapRefs:
+          - name: {{ app_name }}-review-seed
+            key: seed.sql
+{%- endif %}

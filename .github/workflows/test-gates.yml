@@ -1,0 +1,177 @@
+name: Test gates (reusable)
+
+# Playwright + Lighthouse against a live review URL — the GitLab Auto DevOps
+# e2e/browser_performance stages, pointed at `needs.<review>.outputs.url`.
+# advisory=true (the default) mirrors allow_failure: results inform the PR via
+# sticky comments but do not block it; set advisory=false to make them gates.
+
+on:
+  workflow_call:
+    inputs:
+      base_url:
+        description: URL the gates run against (a review env, or staging)
+        type: string
+        required: true
+      e2e_command:
+        description: Command running the Playwright suite ("" = skip e2e)
+        type: string
+        default: ""
+      e2e_container:
+        description: Container image for the e2e job (always required; override with a pre-baked ci-runner image to skip dependency installs)
+        type: string
+        default: "mcr.microsoft.com/playwright:v1.58.2-noble"
+      e2e_artifact:
+        description: Path uploaded when e2e fails
+        type: string
+        default: playwright-report
+      lighthouse_paths:
+        description: Newline-separated paths audited by Lighthouse ("" = skip lighthouse)
+        type: string
+        default: ""
+      lighthouse_runs:
+        description: Collect runs per URL (median is reported)
+        type: string
+        default: "3"
+      advisory:
+        description: '"true" = results comment but never fail the check'
+        type: string
+        default: "true"
+      runs_on:
+        type: string
+        default: ubuntu-latest
+    secrets:
+      E2E_ENV:
+        description: dotenv blob exported before the e2e command (test creds etc.)
+        required: false
+      BASIC_AUTH_CREDS:
+        description: "user:pass when the review env is behind basic auth"
+        required: false
+
+jobs:
+  e2e:
+    if: inputs.e2e_command != ''
+    runs-on: ${{ inputs.runs_on }}
+    continue-on-error: ${{ inputs.advisory == 'true' }}
+    container:
+      image: ${{ inputs.e2e_container }}
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
+      - name: Checkout review-app-ci
+        uses: actions/checkout@v4
+        with:
+          repository: ledoent/review-app-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .review-ci
+
+      - name: Run e2e
+        id: run
+        env:
+          E2E_BASE_URL: ${{ inputs.base_url }}
+          PLAYWRIGHT_BASE_URL: ${{ inputs.base_url }}
+          E2E_ENV: ${{ secrets.E2E_ENV }}
+          # Playwright picks these up via httpCredentials in the app's config;
+          # exported under a stable name so configs can read process.env.
+          E2E_BASIC_AUTH: ${{ secrets.BASIC_AUTH_CREDS }}
+          E2E_COMMAND: ${{ inputs.e2e_command }}
+        run: |
+          set -euo pipefail
+          if [ -n "$E2E_ENV" ]; then
+            set -a; . /dev/stdin <<< "$E2E_ENV"; set +a
+          fi
+          bash -c "$E2E_COMMAND"
+
+      - name: Upload report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-pr${{ github.event.pull_request.number }}
+          path: ${{ inputs.e2e_artifact }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: E2E result comment
+        if: always() && github.event.pull_request.number
+        uses: ./.review-ci/actions/sticky-comment
+        with:
+          marker: e2e
+          pr-number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          body: |
+            ## ${{ steps.run.outcome == 'success' && '✅' || '❌' }} E2E — ${{ steps.run.outcome }}
+
+            **Target:** ${{ inputs.base_url }}
+            ${{ steps.run.outcome != 'success' && 'Download the `playwright-report` artifact from the run for traces.' || '' }}
+
+  lighthouse:
+    if: inputs.lighthouse_paths != ''
+    runs-on: ${{ inputs.runs_on }}
+    continue-on-error: ${{ inputs.advisory == 'true' }}
+    steps:
+      - name: Checkout review-app-ci
+        uses: actions/checkout@v4
+        with:
+          repository: ledoent/review-app-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .review-ci
+
+      - name: Collect
+        id: collect
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          PATHS: ${{ inputs.lighthouse_paths }}
+          RUNS: ${{ inputs.lighthouse_runs }}
+          BASIC_AUTH: ${{ secrets.BASIC_AUTH_CREDS }}
+        run: |
+          set -euo pipefail
+          urls=()
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            urls+=(--collect.url="${BASE_URL%/}${p}")
+          done <<< "$PATHS"
+          extra=()
+          if [ -n "$BASIC_AUTH" ]; then
+            auth=$(printf '%s' "$BASIC_AUTH" | base64 -w0 2>/dev/null || printf '%s' "$BASIC_AUTH" | base64)
+            extra+=(--collect.settings.extraHeaders="{\"Authorization\":\"Basic $auth\"}")
+          fi
+          # Warm ISR/edge caches so the first measured run is not a cold hit.
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            curl -s -o /dev/null -m 20 ${BASIC_AUTH:+-u "$BASIC_AUTH"} "${BASE_URL%/}${p}" || true
+          done <<< "$PATHS"
+          npx --yes @lhci/cli@0.15.x collect "${urls[@]}" \
+            --collect.numberOfRuns="$RUNS" "${extra[@]}"
+
+      - name: Summarize
+        id: summary
+        run: |
+          set -euo pipefail
+          node .review-ci/scripts/lh-summary.mjs
+          {
+            echo "table<<LHEOF"
+            cat lh-summary.md
+            echo "LHEOF"
+          } >> "$GITHUB_OUTPUT"
+          cat lh-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lighthouse artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-pr${{ github.event.pull_request.number }}
+          path: .lighthouseci
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Lighthouse comment
+        if: always() && github.event.pull_request.number && steps.summary.outputs.table != ''
+        uses: ./.review-ci/actions/sticky-comment
+        with:
+          marker: lighthouse
+          pr-number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          body: |
+            ## Lighthouse — ${{ inputs.base_url }} (median of ${{ inputs.lighthouse_runs }})
+
+            ${{ steps.summary.outputs.table }}

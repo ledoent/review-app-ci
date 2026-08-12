@@ -1,0 +1,17 @@
+app_name: cad-plm
+repo_slug: cad-plm
+github_org: ledoent
+registry: ghcr
+cluster_auth: kubeconfig
+review_trigger: auto
+review_tier: full
+db_mode: app-endpoint
+seed_command: "scripts/seed-admin.sh"
+generated_secret_keys: "BETTER_AUTH_SECRET"
+host_in_build: false
+basic_auth: false
+e2e_command: "npx playwright test e2e/staging-smoke.spec.ts"
+lighthouse_paths: "/"
+manage_deploy_workflow: true
+scaffold_k8s_manifests: true
+slot_count: "4"

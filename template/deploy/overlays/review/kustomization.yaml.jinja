@@ -1,0 +1,62 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Review environments are ephemeral — one per PR, host from a claimed slot.
+#
+# Parameterization is kustomize-native and this overlay BUILDS AS COMMITTED:
+# CI overwrites params.env, then `kustomize edit set namespace` and
+# `kustomize edit set image` (see review-app-ci actions/write-params). No sed,
+# no sentinels — `kustomize build .` here must always succeed, and template CI
+# enforces it.
+#
+# The generated review-params ConfigMap does double duty:
+#   - `replacements` below push REVIEW_HOST into the two spec fields that need
+#     the hostname (ingress rule + TLS);
+#   - the Deployment's envFrom (patches/env.yaml) exposes REVIEW_URL/
+#     REVIEW_HOST to the app, which is how host-derived env vars flow without
+#     kustomize needing to "reach into ConfigMap values".
+
+namespace: {{ app_name }}-pr0
+
+resources:
+{%- if review_tier == 'light' %}
+  # Light tier: only the app itself. The backend (Saleor, Typesense, ...)
+  # stays in {{ shared_backend_namespace }} and is reached cross-namespace.
+  - ../../base{% if base_component != '.' %}/{{ base_component }}{% endif %}
+{%- else %}
+  - ../../base
+{%- if db_mode == 'sql-configmap' %}
+  - cnpg-cluster.yaml
+{%- endif %}
+{%- endif %}
+  - quota.yaml
+
+configMapGenerator:
+  - name: review-params
+    envs: [params.env]
+generatorOptions:
+  disableNameSuffixHash: true
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: review-params
+      fieldPath: data.REVIEW_HOST
+    targets:
+      - select:
+          kind: Ingress
+          name: {{ app_name }}
+        fieldPaths:
+          - spec.rules.0.host
+          - spec.tls.0.hosts.0
+
+patches:
+  - path: patches/env.yaml
+  - path: patches/ingress.yaml
+    target:
+      kind: Ingress
+      name: {{ app_name }}
+
+images:
+  - name: {{ image_ref }}
+    newTag: latest  # overwritten by CI (kustomize edit set image)

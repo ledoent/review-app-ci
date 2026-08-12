@@ -1,0 +1,183 @@
+name: Deploy environment (reusable)
+
+# Staging/production promotion. Callers trigger staging on push to main and
+# production on a v* tag (or manual dispatch), both behind a GitHub
+# environment so protection rules and deployment history apply.
+#
+# This is also where GitHub secrets become cluster secrets: the APP_ENV JSON
+# secret is materialized as <app>-secrets in the target namespace. Review
+# environments then COPY named secrets from staging — one seeding point, one
+# copying mechanism, no per-workflow --from-literal drift.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "staging | production"
+        type: string
+        required: true
+      app_name:
+        type: string
+        required: true
+      image:
+        type: string
+        required: true
+      image_tag:
+        type: string
+        required: true
+      migrator_image:
+        type: string
+        default: ""
+      overlay:
+        description: Overlay path (defaults to deploy/overlays/<environment>)
+        type: string
+        default: ""
+      namespace:
+        description: Target namespace (defaults to <app>-<environment>)
+        type: string
+        default: ""
+      deployment_name:
+        type: string
+        default: ""
+      env_url:
+        description: Public URL recorded on the GitHub environment
+        type: string
+        default: ""
+      secret_name:
+        description: Cluster secret materialized from APP_ENV (defaults to <app>-secrets)
+        type: string
+        default: ""
+      cluster_auth:
+        type: string
+        default: kubeconfig
+      wif_provider:
+        type: string
+        default: ""
+      gcp_service_account:
+        type: string
+        default: ""
+      gcp_project:
+        type: string
+        default: ""
+      gke_cluster:
+        type: string
+        default: ""
+      gke_zone:
+        type: string
+        default: ""
+      runs_on:
+        type: string
+        default: ubuntu-latest
+    secrets:
+      KUBE_CONFIG:
+        required: false
+      APP_ENV:
+        description: JSON object {"KEY":"value",...} -> cluster secret. Empty = leave existing secret alone.
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs_on }}
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.env_url }}
+    concurrency:
+      group: deploy-${{ inputs.app_name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      NS: ${{ inputs.namespace || format('{0}-{1}', inputs.app_name, inputs.environment) }}
+      OVERLAY: ${{ inputs.overlay || format('deploy/overlays/{0}', inputs.environment) }}
+    steps:
+      - name: Validate inputs
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CLUSTER_AUTH: ${{ inputs.cluster_auth }}
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in staging|production) ;;
+            *) echo "::error::environment must be staging or production, got '$ENVIRONMENT'"; exit 1 ;; esac
+          case "$CLUSTER_AUTH" in kubeconfig|gke-wif) ;;
+            *) echo "::error::unknown cluster_auth '$CLUSTER_AUTH'"; exit 1 ;; esac
+
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
+      - name: Checkout review-app-ci
+        uses: actions/checkout@v4
+        with:
+          repository: ledoent/review-app-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .review-ci
+
+      - name: Setup deploy tools
+        uses: ./.review-ci/actions/setup-deploy
+        with:
+          cluster-auth: ${{ inputs.cluster_auth }}
+          kube-config: ${{ secrets.KUBE_CONFIG }}
+          wif-provider: ${{ inputs.wif_provider }}
+          gcp-service-account: ${{ inputs.gcp_service_account }}
+          gcp-project: ${{ inputs.gcp_project }}
+          gke-cluster: ${{ inputs.gke_cluster }}
+          gke-zone: ${{ inputs.gke_zone }}
+
+      - name: Materialize APP_ENV secret
+        env:
+          APP_ENV: ${{ secrets.APP_ENV }}
+          SECRET_NAME: ${{ inputs.secret_name || format('{0}-secrets', inputs.app_name) }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APP_ENV" ]; then
+            echo "no APP_ENV secret passed; leaving $SECRET_NAME untouched"
+            exit 0
+          fi
+          echo "$APP_ENV" | jq -e 'type == "object"' >/dev/null \
+            || { echo "::error::APP_ENV is not a JSON object"; exit 1; }
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          echo "$APP_ENV" | jq '{apiVersion: "v1", kind: "Secret",
+            metadata: {name: env.SECRET_NAME, namespace: env.NS},
+            type: "Opaque", stringData: .}' \
+            | kubectl apply -f - >/dev/null
+          echo "materialized $SECRET_NAME in $NS ($(echo "$APP_ENV" | jq 'keys | length') keys)"
+
+      - name: Set image and apply
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAG: ${{ inputs.image_tag }}
+          MIGRATOR: ${{ inputs.migrator_image }}
+        run: |
+          set -euo pipefail
+          test -f "$OVERLAY/kustomization.yaml" || { echo "::error::$OVERLAY has no kustomization.yaml"; exit 1; }
+          cd "$OVERLAY"
+          kustomize edit set image "$IMAGE=$IMAGE:$TAG"
+          [ -z "$MIGRATOR" ] || kustomize edit set image "$MIGRATOR=$MIGRATOR:$TAG"
+          cd - >/dev/null
+          kustomize build "$OVERLAY" | kubectl apply --server-side --force-conflicts -f -
+
+      # Hard-fail. A `|| echo "migration skipped"` here once let production
+      # deploy an unmigrated schema and report success.
+      - name: Run migrations
+        if: inputs.migrator_image != ''
+        env:
+          MIGRATOR: ${{ inputs.migrator_image }}
+          TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          JOB="migrate-$(echo "$TAG" | tr -c 'a-z0-9-' '-' | sed 's/-*$//' | cut -c1-40)"
+          kubectl -n "$NS" delete job "$JOB" --ignore-not-found
+          kubectl -n "$NS" create job "$JOB" --image="$MIGRATOR:$TAG"
+          if ! kubectl -n "$NS" wait --for=condition=complete "job/$JOB" --timeout=300s; then
+            echo "::error::migration job failed"
+            kubectl -n "$NS" logs "job/$JOB" --tail=100 || true
+            exit 1
+          fi
+
+      - name: Wait for rollout
+        env:
+          DEPLOY_NAME: ${{ inputs.deployment_name || inputs.app_name }}
+        run: kubectl -n "$NS" rollout status "deploy/$DEPLOY_NAME" --timeout=300s
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== pods ==="; kubectl -n "$NS" get pods -o wide || true
+          echo "=== events ==="; kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40 || true
