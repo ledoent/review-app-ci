@@ -110,11 +110,14 @@ jobs:
           set -euo pipefail
           OWNER="${GITHUB_REPOSITORY%%/*}"
           PKG="${PACKAGE:-${GITHUB_REPOSITORY##*/}}"
-          version_id=$(gh api "orgs/$OWNER/packages/container/$PKG/versions" --paginate \
-            --jq ".[] | select(.metadata.container.tags[]? == \"pr-$PR\") | .id" | head -1)
-          if [ -n "$version_id" ]; then
+          # Builds tag pr-<N>-<sha8>, one immutable tag per push — match the
+          # prefix WITH the trailing dash (so pr-4 never matches pr-45) plus
+          # the bare pr-<N> legacy form, and delete every matching version.
+          deleted=0
+          while IFS= read -r version_id; do
+            [ -n "$version_id" ] || continue
             gh api -X DELETE "orgs/$OWNER/packages/container/$PKG/versions/$version_id"
-            echo "deleted pr-$PR package version $version_id"
-          else
-            echo "no pr-$PR package version found"
-          fi
+            deleted=$((deleted+1))
+          done < <(gh api "orgs/$OWNER/packages/container/$PKG/versions" --paginate \
+            --jq ".[] | select(.metadata.container.tags[]? | (. == \"pr-$PR\" or startswith(\"pr-$PR-\"))) | .id")
+          echo "deleted $deleted package version(s) for pr-$PR"

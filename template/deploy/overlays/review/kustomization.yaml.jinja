@@ -56,6 +56,18 @@ patches:
     target:
       kind: Ingress
       name: {{ app_name }}
+  # Strip any cluster-issuer the BASE ingress carries (null in a strategic
+  # merge deletes the key; no-op when absent). Without this, cert-manager's
+  # ingress-shim would mint a per-review Certificate targeting the secret
+  # named wildcard-tls and overwrite the copied wildcard cert — re-issuing
+  # per PR against the Let's Encrypt duplicate-certificate limit.
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: {{ app_name }}
+        annotations:
+          cert-manager.io/cluster-issuer: null
 
 images:
   - name: {{ image_ref }}

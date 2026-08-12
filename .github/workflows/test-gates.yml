@@ -2,8 +2,8 @@ name: Test gates (reusable)
 
 # Playwright + Lighthouse against a live review URL — the GitLab Auto DevOps
 # e2e/browser_performance stages, pointed at `needs.<review>.outputs.url`.
-# advisory=true (the default) mirrors allow_failure: results inform the PR via
-# sticky comments but do not block it; set advisory=false to make them gates.
+# Blocking by default (a red gate turns the PR red, matching the pre-migration
+# behavior); advisory=true demotes results to sticky comments only.
 
 on:
   workflow_call:
@@ -17,7 +17,7 @@ on:
         type: string
         default: ""
       e2e_container:
-        description: Container image for the e2e job (always required; override with a pre-baked ci-runner image to skip dependency installs)
+        description: Container image for the e2e job. ghcr.io images are pulled with the workflow token (private packages work if this repo has read access).
         type: string
         default: "mcr.microsoft.com/playwright:v1.58.2-noble"
       e2e_artifact:
@@ -28,6 +28,14 @@ on:
         description: Newline-separated paths audited by Lighthouse ("" = skip lighthouse)
         type: string
         default: ""
+      lighthouse_container:
+        description: Container image for the lighthouse job ("" = bare runner; the image must provide Chrome, e.g. a ci-runner image with CHROME_PATH set)
+        type: string
+        default: ""
+      lighthouse_config:
+        description: Repo-relative lighthouserc file passed to lhci collect (chromeFlags, preset, skipAudits live there)
+        type: string
+        default: ""
       lighthouse_runs:
         description: Collect runs per URL (median is reported)
         type: string
@@ -35,7 +43,7 @@ on:
       advisory:
         description: '"true" = results comment but never fail the check'
         type: string
-        default: "true"
+        default: "false"
       runs_on:
         type: string
         default: ubuntu-latest
@@ -52,8 +60,10 @@ jobs:
     if: inputs.e2e_command != ''
     runs-on: ${{ inputs.runs_on }}
     continue-on-error: ${{ inputs.advisory == 'true' }}
-    container:
-      image: ${{ inputs.e2e_container }}
+    # ghcr images get the workflow token as pull credentials (needed for
+    # private ci-runner images); other registries (mcr, docker.io) stay
+    # anonymous — sending GitHub credentials at them fails the login.
+    container: ${{ startsWith(inputs.e2e_container, 'ghcr.io/') && fromJSON(format('{{"image":{0},"credentials":{{"username":{1},"password":{2}}}}}', toJSON(inputs.e2e_container), toJSON(github.actor), toJSON(github.token))) || inputs.e2e_container }}
     steps:
       - name: Checkout app repo
         uses: actions/checkout@v4
@@ -71,8 +81,8 @@ jobs:
           E2E_BASE_URL: ${{ inputs.base_url }}
           PLAYWRIGHT_BASE_URL: ${{ inputs.base_url }}
           E2E_ENV: ${{ secrets.E2E_ENV }}
-          # Playwright picks these up via httpCredentials in the app's config;
-          # exported under a stable name so configs can read process.env.
+          # The app's Playwright config must read this into httpCredentials
+          # when the review ingress runs basic auth.
           E2E_BASIC_AUTH: ${{ secrets.BASIC_AUTH_CREDS }}
           E2E_COMMAND: ${{ inputs.e2e_command }}
         run: |
@@ -86,7 +96,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report-pr${{ github.event.pull_request.number }}
+          name: playwright-report-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
           path: ${{ inputs.e2e_artifact }}
           retention-days: 7
           if-no-files-found: ignore
@@ -108,7 +118,12 @@ jobs:
     if: inputs.lighthouse_paths != ''
     runs-on: ${{ inputs.runs_on }}
     continue-on-error: ${{ inputs.advisory == 'true' }}
+    container: ${{ startsWith(inputs.lighthouse_container, 'ghcr.io/') && fromJSON(format('{{"image":{0},"credentials":{{"username":{1},"password":{2}}}}}', toJSON(inputs.lighthouse_container), toJSON(github.actor), toJSON(github.token))) || inputs.lighthouse_container }}
     steps:
+      # App checkout first: lighthouse_config is a repo-relative path.
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
       - name: Checkout review-app-ci
         uses: actions/checkout@v4
         with:
@@ -122,6 +137,7 @@ jobs:
           BASE_URL: ${{ inputs.base_url }}
           PATHS: ${{ inputs.lighthouse_paths }}
           RUNS: ${{ inputs.lighthouse_runs }}
+          LHCI_CONFIG: ${{ inputs.lighthouse_config }}
           BASIC_AUTH: ${{ secrets.BASIC_AUTH_CREDS }}
         run: |
           set -euo pipefail
@@ -131,6 +147,9 @@ jobs:
             urls+=(--collect.url="${BASE_URL%/}${p}")
           done <<< "$PATHS"
           extra=()
+          if [ -n "$LHCI_CONFIG" ]; then
+            extra+=(--config="$LHCI_CONFIG")
+          fi
           if [ -n "$BASIC_AUTH" ]; then
             auth=$(printf '%s' "$BASIC_AUTH" | base64 -w0 2>/dev/null || printf '%s' "$BASIC_AUTH" | base64)
             extra+=(--collect.settings.extraHeaders="{\"Authorization\":\"Basic $auth\"}")
@@ -159,7 +178,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lighthouse-pr${{ github.event.pull_request.number }}
+          name: lighthouse-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
           path: .lighthouseci
           retention-days: 7
           if-no-files-found: ignore

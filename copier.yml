@@ -80,14 +80,17 @@ wif_provider:
   default: projects/588570914403/locations/global/workloadIdentityPools/github/providers/github-oidc
   when: "{{ cluster_auth == 'gke-wif' }}"
 
+# gar_project is conditioned on registry==gar, so guard explicitly: a skipped
+# question still carries its default value, and `| default('')` would leak
+# meas-inst-prod into non-GAR gke-wif combos.
 gcp_service_account:
   type: str
-  default: "{{ app_name }}-ci@{{ gar_project | default('') }}.iam.gserviceaccount.com"
+  default: "{% if registry == 'gar' %}{{ app_name }}-ci@{{ gar_project }}.iam.gserviceaccount.com{% endif %}"
   when: "{{ cluster_auth == 'gke-wif' }}"
 
 gcp_project:
   type: str
-  default: "{{ gar_project | default('') }}"
+  default: "{% if registry == 'gar' %}{{ gar_project }}{% endif %}"
   when: "{{ cluster_auth == 'gke-wif' }}"
 
 gke_cluster:
@@ -219,17 +222,40 @@ basic_auth:
 e2e_command:
   type: str
   default: ""
-  help: 'Playwright command run against the review URL ("" = skip e2e)'
+  help: 'Playwright command run against the review URL, INCLUDING dependency install ("" = skip e2e)'
 
 e2e_container:
   type: str
   default: mcr.microsoft.com/playwright:v1.58.2-noble
   when: "{{ e2e_command != '' }}"
 
+e2e_artifact:
+  type: str
+  default: playwright-report
+  help: "Path uploaded when e2e fails (monorepos: apps/<app>/playwright-report)"
+  when: "{{ e2e_command != '' }}"
+
 lighthouse_paths:
   type: str
   default: ""
   help: 'Comma list of paths audited by Lighthouse ("" = skip)'
+
+lighthouse_container:
+  type: str
+  default: ""
+  help: 'Container for the lighthouse job ("" = bare runner; must provide Chrome + CHROME_PATH)'
+  when: "{{ lighthouse_paths != '' }}"
+
+lighthouse_config:
+  type: str
+  default: ""
+  help: Repo-relative lighthouserc file (chromeFlags/preset/skipAudits)
+  when: "{{ lighthouse_paths != '' }}"
+
+wildcard_secret:
+  type: str
+  default: "{% if review_domain == 'mi.ledoweb.com' %}mi-wildcard-tls{% else %}wildcard-tls{% endif %}"
+  help: Source TLS secret in shared-certs; copied into each review namespace AS wildcard-tls
 
 manage_deploy_workflow:
   type: bool

@@ -53,18 +53,42 @@ DRY_RUN="${DRY_RUN:-true}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# Deliberately unguarded: every kubectl below is error-tolerant so one stuck
+# object can't stop the sweep, which means a broken kubeconfig or revoked
+# RBAC would otherwise read as "nothing to reap" forever. Fail loudly here
+# instead.
+kubectl get namespace >/dev/null
+
 # One call per PR, and a real success check: `gh api --jq` writes its error
 # body to stdout on a 404, so an `|| echo missing` form produces JSON
 # concatenated with "missing" — matching nothing. Test the exit status.
-pr_state() { # pr_state <n> -> "open"/"closed"/"missing", sets PR_LABELS
+#
+# Results land in GLOBALS (PR_STATE / PR_LABELS), never via command
+# substitution: `state=$(pr_state ...)` would run the function in a subshell
+# and the PR_LABELS assignment would evaporate — which under `set -u` made
+# the label check blow up in a way that read as "no review label" and
+# nightly-reaped every live, labelled environment. Reproduced; do not
+# reintroduce.
+pr_state() { # pr_state <n> -> sets PR_STATE (open/closed/missing), PR_LABELS
   local json
   if json=$(gh api "repos/$REPO/pulls/$1" 2>/dev/null); then
     PR_LABELS=$(echo "$json" | jq -r '[.labels[].name] | join(",")')
-    echo "$json" | jq -r .state
+    PR_STATE=$(echo "$json" | jq -r .state)
   else
     PR_LABELS=""
-    echo "missing"
+    PR_STATE="missing"
   fi
+}
+
+# Fixed-string label comparison — never a constructed regex: a label like
+# "needs+review" in an ERE would error grep, and the inverted pipeline would
+# read as "unlabelled" and reap.
+has_review_label() { # has_review_label <comma-list-of-pr-labels>
+  local l
+  for l in ${REVIEW_LABELS//,/ }; do
+    case ",$1," in *",$l,"*) return 0 ;; esac
+  done
+  return 1
 }
 
 now=$(date -u +%s)
@@ -82,13 +106,13 @@ for entry in "${NS[@]}"; do
   pr="${ns#"$NS_PREFIX"}"
   age_h=$(( (now - $(date -u -d "$created" +%s)) / 3600 ))
 
-  state=$(pr_state "$pr")
+  pr_state "$pr"
   reason=""
-  if [ "$state" = "missing" ]; then
+  if [ "$PR_STATE" = "missing" ]; then
     reason="PR #$pr does not exist"
-  elif [ "$state" != "open" ]; then
-    reason="PR #$pr is $state"
-  elif [ -n "$REVIEW_LABELS" ] && ! echo ",$PR_LABELS," | grep -qE ",($(echo "$REVIEW_LABELS" | tr ',' '|')),"; then
+  elif [ "$PR_STATE" != "open" ]; then
+    reason="PR #$pr is $PR_STATE"
+  elif [ -n "$REVIEW_LABELS" ] && ! has_review_label "$PR_LABELS"; then
     reason="PR #$pr carries no review label"
   elif [ "$age_h" -ge "$TTL_HOURS" ]; then
     # Deliberately reaps open, labelled PRs past TTL: a review environment is
@@ -132,14 +156,19 @@ if [ -n "$DB_CR_PREFIX" ]; then
 fi
 
 # ---- pass 3: orphan slot leases ---------------------------------------------
+# A lease is reaped only when its PR is not open. "Namespace gone" alone is
+# NOT sufficient: the lease is claimed before the build, and the namespace
+# only appears minutes later in the deploy job — a sweep firing in that
+# window would free the slot out from under an in-flight deploy of a live PR.
 while IFS=$'\t' read -r lease pr ns; do
   [ -n "$lease" ] || continue
   reason=""
-  if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
-    reason="namespace $ns is gone"
-  else
-    state=$(pr_state "$pr")
-    [ "$state" = "open" ] || reason="PR #$pr is $state"
+  pr_state "$pr"
+  if [ "$PR_STATE" != "open" ]; then
+    reason="PR #$pr is $PR_STATE"
+  elif ! kubectl get namespace "$ns" >/dev/null 2>&1; then
+    echo "keep   lease $lease (PR #$pr open; namespace not up yet or deploy in flight)"
+    continue
   fi
   [ -n "$reason" ] || continue
   echo "REAP   lease $lease — $reason"

@@ -34,7 +34,12 @@ jobs:
       ttl_hours: {% raw %}${{ vars.REVIEW_TTL_HOURS || '48' }}{% endraw %}
       # Scheduled runs always delete; only a manual run can ask to be shown
       # the list first.
-      dry_run: {% raw %}${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}{% endraw %}
+      {%- raw %}
+      # format() coerces the dispatch checkbox's boolean to a string — the
+      # reusable input is type string, and boolean-into-string fails type
+      # checking exactly on the manual dry-run preview path.
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || 'false' }}
+      {%- endraw %}
       cluster_auth: {{ cluster_auth }}
 {%- if cluster_auth == 'gke-wif' %}
       wif_provider: {{ wif_provider }}

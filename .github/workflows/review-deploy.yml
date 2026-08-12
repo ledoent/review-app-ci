@@ -209,6 +209,8 @@ jobs:
           CLUSTER_AUTH: ${{ inputs.cluster_auth }}
           SLOT_IN: ${{ inputs.slot }}
           HOST_IN: ${{ inputs.host }}
+          GENERATED_NAME: ${{ inputs.generated_secret_keys && (inputs.generated_secret_name || format('{0}-secrets', inputs.app_name)) || '' }}
+          COPY_SECRETS: ${{ inputs.copy_secrets }}
         run: |
           set -euo pipefail
           case "$TIER" in light|full) ;; *) echo "::error::tier must be light or full, got '$TIER'"; exit 1 ;; esac
@@ -223,6 +225,14 @@ jobs:
           fi
           if [ -n "$SLOT_IN" ] && [ -z "$HOST_IN" ]; then
             echo "::error::when slot is pre-claimed, host must be passed too"; exit 1
+          fi
+          # Copy-then-generate would see the copied secret and skip the
+          # generated keys — silently sharing staging's values instead.
+          if [ -n "$GENERATED_NAME" ] && [ -n "$COPY_SECRETS" ]; then
+            case ",$COPY_SECRETS," in
+              *",$GENERATED_NAME,"*)
+                echo "::error::generated_secret_name '$GENERATED_NAME' is also in copy_secrets — the copy would mask the generated keys"; exit 1 ;;
+            esac
           fi
 
       - name: Checkout app repo
@@ -323,6 +333,9 @@ jobs:
               --dry-run=client -o yaml | kubectl apply -f -
           fi
 
+      # Secret material is assembled with jq from ENV and applied via stdin —
+      # never on a command line, where it would be visible in /proc to any
+      # process on a shared runner.
       - name: Registry pull secret
         env:
           REGISTRY_PULL_TOKEN: ${{ secrets.REGISTRY_PULL_TOKEN }}
@@ -335,11 +348,16 @@ jobs:
             exit 0
           fi
           REG_HOST="${IMAGE%%/*}"
-          kubectl -n "$NS" create secret docker-registry "$PULL_SECRET" \
-            --docker-server="$REG_HOST" \
-            --docker-username=x-access-token \
-            --docker-password="$REGISTRY_PULL_TOKEN" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          jq -n --arg ns "$NS" --arg name "$PULL_SECRET" --arg host "$REG_HOST" \
+            '{apiVersion: "v1", kind: "Secret",
+              metadata: {name: $name, namespace: $ns},
+              type: "kubernetes.io/dockerconfigjson",
+              stringData: {".dockerconfigjson":
+                ({auths: {($host): {username: "x-access-token",
+                                    password: env.REGISTRY_PULL_TOKEN,
+                                    auth: ("x-access-token:" + env.REGISTRY_PULL_TOKEN | @base64)}}} | tojson)}}' \
+            | kubectl apply -f - >/dev/null
+          echo "pull secret $PULL_SECRET refreshed"
 
       - name: Copy shared secrets from staging
         if: inputs.copy_secrets != ''
@@ -353,12 +371,15 @@ jobs:
             ./.review-ci/scripts/copy-secret.sh "$s" "$STAGING_NS" "$NS"
           done
 
+      # Renamed to the canonical `wildcard-tls` on copy: overlays reference
+      # one name while clusters store the source under another
+      # (mi-wildcard-tls on meas-apps).
       - name: Copy wildcard TLS secret
         if: inputs.wildcard_secret != ''
         env:
           WILDCARD: ${{ inputs.wildcard_secret }}
           SRC_NS: ${{ inputs.wildcard_source_ns }}
-        run: ./.review-ci/scripts/copy-secret.sh "$WILDCARD" "$SRC_NS" "$NS"
+        run: ./.review-ci/scripts/copy-secret.sh "$WILDCARD" "$SRC_NS" "$NS" wildcard-tls
 
       # Created once and kept: regenerating on every push would invalidate
       # sessions mid-review.
@@ -373,13 +394,18 @@ jobs:
             echo "$SECRET_NAME already exists; keeping"
             exit 0
           fi
-          args=()
+          json='{}'
           IFS=',' read -ra keys <<< "$KEYS"
           for k in "${keys[@]}"; do
             [ -n "$k" ] || continue
-            args+=("--from-literal=$k=$(openssl rand -hex 32)")
+            json=$(RAND=$(openssl rand -hex 32) jq --arg k "$k" '. + {($k): env.RAND}' <<< "$json")
           done
-          kubectl -n "$NS" create secret generic "$SECRET_NAME" "${args[@]}"
+          jq -n --arg ns "$NS" --arg name "$SECRET_NAME" --argjson data "$json" \
+            '{apiVersion: "v1", kind: "Secret",
+              metadata: {name: $name, namespace: $ns},
+              type: "Opaque", stringData: $data}' \
+            | kubectl create -f - >/dev/null
+          echo "generated $SECRET_NAME"
 
       # Light tier: a per-PR database inside staging's CNPG cluster. The CR
       # must live in the CLUSTER's namespace (CNPG resolves cluster.name in its
@@ -426,16 +452,23 @@ jobs:
             # Synthesised rather than copied: same cluster and role as staging,
             # different database. Direct, not through PgBouncer: auth_query
             # would need per-database setup for one pod's worth of connections.
+            # Credentials never touch a command line (jq env + stdin apply),
+            # and user/password are URL-encoded into the DSN — an @ or / in
+            # the staging password must not produce a broken URI.
             PW=$(kubectl -n "$STAGING_NS" get secret "$DB_SECRET" -o jsonpath='{.data.password}' | base64 -d)
             DB_USER=$(kubectl -n "$STAGING_NS" get secret "$DB_SECRET" -o jsonpath='{.data.user}' | base64 -d)
             DB_HOST="${CLUSTER_NAME}-rw.${STAGING_NS}.svc.cluster.local"
-            URI="postgresql://${DB_USER}:${PW}@${DB_HOST}:5432/${DB}"
-            kubectl -n "$NS" create secret generic "$DB_SECRET" \
-              --from-literal=uri="$URI" --from-literal=pooler-uri="$URI" \
-              --from-literal=dbname="$DB" --from-literal=host="$DB_HOST" \
-              --from-literal=port=5432 --from-literal=user="$DB_USER" \
-              --from-literal=username="$DB_USER" --from-literal=password="$PW" \
-              --dry-run=client -o yaml | kubectl apply -f -
+            PW="$PW" DB_USER="$DB_USER" jq -n --arg ns "$NS" --arg name "$DB_SECRET" \
+              --arg db "$DB" --arg host "$DB_HOST" \
+              '(env.DB_USER | @uri) as $eu | (env.PW | @uri) as $ep |
+               ("postgresql://" + $eu + ":" + $ep + "@" + $host + ":5432/" + $db) as $uri |
+               {apiVersion: "v1", kind: "Secret",
+                metadata: {name: $name, namespace: $ns}, type: "Opaque",
+                stringData: {uri: $uri, "pooler-uri": $uri, dbname: $db,
+                             host: $host, port: "5432", user: env.DB_USER,
+                             username: env.DB_USER, password: env.PW}}' \
+              | kubectl apply -f - >/dev/null
+            echo "db secret $DB_SECRET synthesised"
           fi
 
       # Full tier, phase 1: the seed ConfigMap must exist BEFORE the CNPG
@@ -478,18 +511,73 @@ jobs:
           set -euo pipefail
           kustomize build "$OVERLAY" | kubectl apply --server-side --force-conflicts -f -
 
+      # Immediately after the ingress exists, BEFORE migrations and rollout:
+      # the gap between "publicly routable on wildcard DNS" and "auth gate on"
+      # must be seconds, not minutes — this overlay may carry an auth-bypass
+      # flag, which is the whole reason basic_auth is mandatory for it.
+      - name: Basic auth
+        if: inputs.basic_auth == 'true'
+        env:
+          HTPASSWD: ${{ secrets.BASIC_AUTH_HTPASSWD }}
+          INGRESS: ${{ inputs.ingress_name || inputs.app_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HTPASSWD" ]; then
+            echo "::error::basic_auth=true but the BASIC_AUTH_HTPASSWD secret is empty"; exit 1
+          fi
+          jq -n --arg ns "$NS" '{apiVersion: "v1", kind: "Secret",
+            metadata: {name: "review-basic-auth", namespace: $ns},
+            type: "Opaque", stringData: {auth: env.HTPASSWD}}' \
+            | kubectl apply -f - >/dev/null
+          kubectl -n "$NS" annotate ingress "$INGRESS" --overwrite \
+            nginx.ingress.kubernetes.io/auth-type=basic \
+            nginx.ingress.kubernetes.io/auth-secret=review-basic-auth \
+            nginx.ingress.kubernetes.io/auth-realm="review environment"
+
       # Hard-fail: a swallowed migration failure produces a green deploy of a
-      # broken schema, which is strictly worse than a red job.
+      # broken schema, which is strictly worse than a red job. The Job is a
+      # full manifest, not `kubectl create job`: it needs the pull secret
+      # (private registries) and the app's env wiring (params ConfigMap +
+      # DB secret) or it can't reach the database it is migrating.
       - name: Run migrations
         if: inputs.migrator_image != ''
         env:
           MIGRATOR: ${{ inputs.migrator_image }}
           TAG: ${{ inputs.image_tag }}
+          PULL_SECRET: ${{ inputs.pull_secret_name }}
+          DB_SECRET: ${{ inputs.db_secret_name }}
         run: |
           set -euo pipefail
-          JOB="migrate-$(echo "$TAG" | tr -c 'a-z0-9-' '-' | sed 's/-*$//' | cut -c1-40)"
-          kubectl -n "$NS" delete job "$JOB" --ignore-not-found
-          kubectl -n "$NS" create job "$JOB" --image="$MIGRATOR:$TAG"
+          # cut FIRST, then strip trailing dashes — the reverse can emit a
+          # name ending in '-', which is not a valid DNS-1123 label.
+          JOB="migrate-$(echo "$TAG" | tr -c 'a-z0-9-' '-' | cut -c1-40 | sed 's/-*$//')"
+          kubectl -n "$NS" delete job "$JOB" --ignore-not-found --wait=true
+          DB_ENVFROM=""
+          if [ -n "$DB_SECRET" ]; then
+            DB_ENVFROM="
+                      - secretRef:
+                          name: $DB_SECRET"
+          fi
+          kubectl -n "$NS" apply -f - <<EOF
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: $JOB
+          spec:
+            backoffLimit: 1
+            template:
+              spec:
+                restartPolicy: Never
+                imagePullSecrets:
+                  - name: $PULL_SECRET
+                containers:
+                  - name: migrate
+                    image: $MIGRATOR:$TAG
+                    envFrom:
+                      - configMapRef:
+                          name: review-params
+                          optional: true$DB_ENVFROM
+          EOF
           if ! kubectl -n "$NS" wait --for=condition=complete "job/$JOB" --timeout=300s; then
             echo "::error::migration job failed"
             kubectl -n "$NS" logs "job/$JOB" --tail=100 || true
@@ -511,26 +599,6 @@ jobs:
           for p in $(kubectl -n "$NS" get pods -o name 2>/dev/null); do
             echo "--- $p"; kubectl -n "$NS" logs "$p" --tail=50 --all-containers || true
           done
-
-      # Applied by the workflow, not the overlay, so `kustomize build` of the
-      # committed overlay stays auth-free. Mandatory for any app that ships an
-      # auth-bypass flag in its review overlay.
-      - name: Basic auth
-        if: inputs.basic_auth == 'true'
-        env:
-          HTPASSWD: ${{ secrets.BASIC_AUTH_HTPASSWD }}
-          INGRESS: ${{ inputs.ingress_name || inputs.app_name }}
-        run: |
-          set -euo pipefail
-          if [ -z "$HTPASSWD" ]; then
-            echo "::error::basic_auth=true but the BASIC_AUTH_HTPASSWD secret is empty"; exit 1
-          fi
-          kubectl -n "$NS" create secret generic review-basic-auth \
-            --from-literal=auth="$HTPASSWD" --dry-run=client -o yaml | kubectl apply -f -
-          kubectl -n "$NS" annotate ingress "$INGRESS" --overwrite \
-            nginx.ingress.kubernetes.io/auth-type=basic \
-            nginx.ingress.kubernetes.io/auth-secret=review-basic-auth \
-            nginx.ingress.kubernetes.io/auth-realm="review environment"
 
       - name: Seed via app endpoint
         if: inputs.db_mode == 'app-endpoint' && inputs.seed_command != ''

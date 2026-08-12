@@ -15,7 +15,7 @@ spec:
         app: {{ app_name }}
     spec:
       imagePullSecrets:
-        - name: registry-pull
+        - name: {{ pull_secret_name }}
       containers:
         - name: {{ app_name }}
           image: {{ image_ref }}

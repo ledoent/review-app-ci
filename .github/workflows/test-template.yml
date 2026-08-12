@@ -55,7 +55,7 @@ jobs:
       - name: Render
         run: |
           set -euo pipefail
-          copier copy --trust --defaults --force \
+          copier copy --trust --defaults --force --vcs-ref HEAD \
             --data-file "$GITHUB_WORKSPACE/tests/answers/${{ matrix.fixture }}.yml" \
             "$GITHUB_WORKSPACE" /tmp/render
 
@@ -72,7 +72,9 @@ jobs:
           # would seize the shared wildcard secret and reissue it. Match only
           # real annotation usage (key with colon on a non-comment line) —
           # the overlay's own comments explain the rule and must not trip it.
-          if grep -rEn '^[^#]*cluster-issuer:' /tmp/render/deploy/overlays/review/; then
+          # ': null' is the strategic-merge DELETION of the annotation — the
+          # one legitimate appearance.
+          if grep -rEn '^[^#]*cluster-issuer:' /tmp/render/deploy/overlays/review/ | grep -vE ': *null'; then
             echo "::error::review overlay must not set cert-manager.io/cluster-issuer"; exit 1
           fi
           # SMTP credentials must never be copied into review namespaces.
@@ -97,7 +99,7 @@ jobs:
           set -euo pipefail
           cd /tmp/render
           git add -A && git -c user.email=ci@ledoweb.com -c user.name=ci commit -qm render
-          copier copy --trust --defaults --force \
+          copier copy --trust --defaults --force --vcs-ref HEAD \
             --data-file "$GITHUB_WORKSPACE/tests/answers/${{ matrix.fixture }}.yml" \
             "$GITHUB_WORKSPACE" .
           if ! git diff --quiet || [ -n "$(git status --porcelain)" ]; then

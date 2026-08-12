@@ -28,6 +28,14 @@ on:
       migrator_image:
         type: string
         default: ""
+      pull_secret_name:
+        description: Dockerconfig secret refreshed from REGISTRY_PULL_TOKEN (must match the base Deployment's imagePullSecrets)
+        type: string
+        default: registry-pull
+      cnpg_cluster_name:
+        description: When set and <overlay>/cnpg-cluster.yaml exists, it is applied and awaited BEFORE the full overlay (first-bootstrap ordering)
+        type: string
+        default: ""
       overlay:
         description: Overlay path (defaults to deploy/overlays/<environment>)
         type: string
@@ -73,6 +81,9 @@ on:
         required: false
       APP_ENV:
         description: JSON object {"KEY":"value",...} -> cluster secret. Empty = leave existing secret alone.
+        required: false
+      REGISTRY_PULL_TOKEN:
+        description: Refreshes the pull secret every deploy so token rotation cannot strand the namespace on a stale secret
         required: false
 
 jobs:
@@ -120,6 +131,35 @@ jobs:
           gke-cluster: ${{ inputs.gke_cluster }}
           gke-zone: ${{ inputs.gke_zone }}
 
+      # Always runs — the overlays don't carry a Namespace object, and a
+      # first bootstrap without APP_ENV must not fail at apply with
+      # "namespace not found".
+      - name: Ensure namespace
+        run: kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Refresh registry pull secret
+        env:
+          REGISTRY_PULL_TOKEN: ${{ secrets.REGISTRY_PULL_TOKEN }}
+          IMAGE: ${{ inputs.image }}
+          PULL_SECRET: ${{ inputs.pull_secret_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REGISTRY_PULL_TOKEN" ]; then
+            echo "no REGISTRY_PULL_TOKEN; leaving $PULL_SECRET untouched"
+            exit 0
+          fi
+          REG_HOST="${IMAGE%%/*}"
+          jq -n --arg ns "$NS" --arg name "$PULL_SECRET" --arg host "$REG_HOST" \
+            '{apiVersion: "v1", kind: "Secret",
+              metadata: {name: $name, namespace: $ns},
+              type: "kubernetes.io/dockerconfigjson",
+              stringData: {".dockerconfigjson":
+                ({auths: {($host): {username: "x-access-token",
+                                    password: env.REGISTRY_PULL_TOKEN,
+                                    auth: ("x-access-token:" + env.REGISTRY_PULL_TOKEN | @base64)}}} | tojson)}}' \
+            | kubectl apply -f - >/dev/null
+          echo "pull secret $PULL_SECRET refreshed"
+
       - name: Materialize APP_ENV secret
         env:
           APP_ENV: ${{ secrets.APP_ENV }}
@@ -132,12 +172,27 @@ jobs:
           fi
           echo "$APP_ENV" | jq -e 'type == "object"' >/dev/null \
             || { echo "::error::APP_ENV is not a JSON object"; exit 1; }
-          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
           echo "$APP_ENV" | jq '{apiVersion: "v1", kind: "Secret",
             metadata: {name: env.SECRET_NAME, namespace: env.NS},
             type: "Opaque", stringData: .}' \
             | kubectl apply -f - >/dev/null
           echo "materialized $SECRET_NAME in $NS ($(echo "$APP_ENV" | jq 'keys | length') keys)"
+
+      # First-bootstrap ordering: the CNPG cluster must be Ready before the
+      # Deployment that mounts its -app secret, or pods loop in
+      # CreateContainerConfigError.
+      - name: CNPG cluster (phase 1)
+        if: inputs.cnpg_cluster_name != ''
+        env:
+          CLUSTER_NAME: ${{ inputs.cnpg_cluster_name }}
+        run: |
+          set -euo pipefail
+          if [ -f "$OVERLAY/cnpg-cluster.yaml" ]; then
+            kubectl -n "$NS" apply -f "$OVERLAY/cnpg-cluster.yaml"
+            kubectl -n "$NS" wait --for=condition=Ready "cluster/$CLUSTER_NAME" --timeout=600s
+          else
+            echo "no $OVERLAY/cnpg-cluster.yaml; skipping"
+          fi
 
       - name: Set image and apply
         env:
@@ -154,17 +209,40 @@ jobs:
           kustomize build "$OVERLAY" | kubectl apply --server-side --force-conflicts -f -
 
       # Hard-fail. A `|| echo "migration skipped"` here once let production
-      # deploy an unmigrated schema and report success.
+      # deploy an unmigrated schema and report success. Full manifest, not
+      # `kubectl create job`: the migrator needs the pull secret and the
+      # app's secret env to reach its database.
       - name: Run migrations
         if: inputs.migrator_image != ''
         env:
           MIGRATOR: ${{ inputs.migrator_image }}
           TAG: ${{ inputs.image_tag }}
+          PULL_SECRET: ${{ inputs.pull_secret_name }}
+          SECRET_NAME: ${{ inputs.secret_name || format('{0}-secrets', inputs.app_name) }}
         run: |
           set -euo pipefail
-          JOB="migrate-$(echo "$TAG" | tr -c 'a-z0-9-' '-' | sed 's/-*$//' | cut -c1-40)"
-          kubectl -n "$NS" delete job "$JOB" --ignore-not-found
-          kubectl -n "$NS" create job "$JOB" --image="$MIGRATOR:$TAG"
+          JOB="migrate-$(echo "$TAG" | tr -c 'a-z0-9-' '-' | cut -c1-40 | sed 's/-*$//')"
+          kubectl -n "$NS" delete job "$JOB" --ignore-not-found --wait=true
+          kubectl -n "$NS" apply -f - <<EOF
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: $JOB
+          spec:
+            backoffLimit: 1
+            template:
+              spec:
+                restartPolicy: Never
+                imagePullSecrets:
+                  - name: $PULL_SECRET
+                containers:
+                  - name: migrate
+                    image: $MIGRATOR:$TAG
+                    envFrom:
+                      - secretRef:
+                          name: $SECRET_NAME
+                          optional: true
+          EOF
           if ! kubectl -n "$NS" wait --for=condition=complete "job/$JOB" --timeout=300s; then
             echo "::error::migration job failed"
             kubectl -n "$NS" logs "job/$JOB" --tail=100 || true

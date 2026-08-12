@@ -12,9 +12,12 @@ on:
     types: [closed]
 {%- endif %}
 
+# Own concurrency group, never cancelled: sharing the deploy group with
+# cancel-in-progress could kill a teardown between namespace-delete and
+# lease-release when a label is re-added mid-reap, leaking the slot.
 concurrency:
-  group: {% raw %}review-env-${{ github.event.pull_request.number }}{% endraw %}
-  cancel-in-progress: true
+  group: {% raw %}review-cleanup-${{ github.event.pull_request.number }}{% endraw %}
+  cancel-in-progress: false
 
 permissions:
   contents: read

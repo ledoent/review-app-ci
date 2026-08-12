@@ -60,11 +60,14 @@ jobs:
       tag: {% raw %}${{ steps.tag.outputs.tag }}{% endraw %}
     steps:
       - uses: actions/checkout@v4
+      # GITHUB_SHA (the merge commit — what checkout actually built), not
+      # head.sha: tagging the head names a commit that was never built, and a
+      # base-branch change with an unchanged head would reuse an "immutable"
+      # tag for different content.
       - id: tag
         env:
           PR: {% raw %}${{ github.event.pull_request.number }}{% endraw %}
-          SHA: {% raw %}${{ github.event.pull_request.head.sha }}{% endraw %}
-        run: echo "tag=pr-${PR}-$(echo "$SHA" | cut -c1-8)" >> "$GITHUB_OUTPUT"
+        run: echo "tag=pr-${PR}-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 {%- if cluster_auth == 'gke-wif' %}
       - uses: google-github-actions/auth@v2
         with:
@@ -89,6 +92,11 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       # Immutable per-push tag: a mutable tag would let a review environment
       # quietly serve a different commit than the one being reviewed.
+      #
+      # APP_BUILD_ARGS (optional repo secret, multiline KEY=VAL) carries the
+      # app's build-time args — NEXT_PUBLIC_* inlines, Sentry auth token —
+      # without the workflow enumerating them. SENTRY_RELEASE args are passed
+      # unconditionally; buildx warns-and-ignores undeclared ARGs.
       - name: Build & push
         env:
           TAG: {% raw %}${{ steps.tag.outputs.tag }}{% endraw %}
@@ -96,14 +104,24 @@ jobs:
           REVIEW_URL: {% raw %}${{ needs.claim.outputs.url }}{% endraw %}
 {%- endif %}
           IMAGE: {{ image_ref }}
+          APP_BUILD_ARGS: {% raw %}${{ secrets.APP_BUILD_ARGS }}{% endraw %}
         run: |
+          args=()
+          if [ -n "$APP_BUILD_ARGS" ]; then
+            while IFS= read -r kv; do
+              [ -n "$kv" ] && args+=(--build-arg "$kv")
+            done <<< "$APP_BUILD_ARGS"
+          fi
           docker buildx build \
             --output type=image,push=true,oci-mediatypes=true \
             --cache-from "type=registry,ref=${IMAGE}:buildcache" \
             --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
+            --build-arg SENTRY_RELEASE="$TAG" \
+            --build-arg NEXT_PUBLIC_SENTRY_RELEASE="$TAG" \
 {%- if host_in_build %}
             --build-arg NEXT_PUBLIC_SITE_URL="$REVIEW_URL" \
 {%- endif %}
+            "${args[@]}" \
             -f {{ dockerfile }} \
             -t "${IMAGE}:${TAG}" \
             {{ build_context }}
@@ -160,6 +178,9 @@ jobs:
 {%- if pull_secret_name != 'registry-pull' %}
       pull_secret_name: {{ pull_secret_name }}
 {%- endif %}
+{%- if wildcard_secret != 'wildcard-tls' %}
+      wildcard_secret: {{ wildcard_secret }}
+{%- endif %}
       cluster_auth: {{ cluster_auth }}
 {%- if cluster_auth == 'gke-wif' %}
       wif_provider: {{ wif_provider }}
@@ -184,12 +205,19 @@ jobs:
 {%- if e2e_command %}
       e2e_command: "{{ e2e_command }}"
       e2e_container: "{{ e2e_container }}"
+      e2e_artifact: "{{ e2e_artifact }}"
 {%- endif %}
 {%- if lighthouse_paths %}
       lighthouse_paths: |-
 {%- for p in lighthouse_paths.split(',') %}
         {{ p | trim }}
 {%- endfor %}
+{%- if lighthouse_container %}
+      lighthouse_container: "{{ lighthouse_container }}"
+{%- endif %}
+{%- if lighthouse_config %}
+      lighthouse_config: "{{ lighthouse_config }}"
+{%- endif %}
 {%- endif %}
       runs_on: {{ runner }}
     secrets:

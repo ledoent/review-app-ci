@@ -5,15 +5,20 @@
 # on the SECOND run — so it survives first testing and fails later.
 #
 # Usage:
-#   copy-secret.sh <secret-name> <source-namespace> <target-namespace>
+#   copy-secret.sh <secret-name> <source-namespace> <target-namespace> [<target-name>]
+#
+# The optional target-name renames on copy — the overlays reference one
+# canonical name (e.g. wildcard-tls) while clusters may store the source
+# under another (mi-wildcard-tls on meas-apps).
 set -euo pipefail
 
-NAME="${1:?usage: copy-secret.sh <secret-name> <source-ns> <target-ns>}"
-SRC="${2:?usage: copy-secret.sh <secret-name> <source-ns> <target-ns>}"
-DST="${3:?usage: copy-secret.sh <secret-name> <source-ns> <target-ns>}"
+NAME="${1:?usage: copy-secret.sh <secret-name> <source-ns> <target-ns> [<target-name>]}"
+SRC="${2:?usage: copy-secret.sh <secret-name> <source-ns> <target-ns> [<target-name>]}"
+DST="${3:?usage: copy-secret.sh <secret-name> <source-ns> <target-ns> [<target-name>]}"
+DST_NAME="${4:-$NAME}"
 
 kubectl -n "$SRC" get secret "$NAME" -o json \
-  | jq --arg ns "$DST" '{apiVersion, kind, type, data,
-                         metadata: {name: .metadata.name, namespace: $ns}}' \
+  | jq --arg ns "$DST" --arg name "$DST_NAME" \
+       '{apiVersion, kind, type, data, metadata: {name: $name, namespace: $ns}}' \
   | kubectl apply -f - >/dev/null
-echo "copied secret $NAME: $SRC -> $DST"
+echo "copied secret $NAME: $SRC -> $DST/$DST_NAME"

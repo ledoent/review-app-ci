@@ -50,15 +50,27 @@ jobs:
           password: {% raw %}${{ secrets.ZOT_PASSWORD }}{% endraw %}
 {%- endif %}
       - uses: docker/setup-buildx-action@v3
+      # APP_BUILD_ARGS: optional repo secret, multiline KEY=VAL, for
+      # NEXT_PUBLIC_* inlines and Sentry sourcemap credentials.
       - name: Build & push
         env:
           TAG: {% raw %}${{ steps.tag.outputs.tag }}{% endraw %}
           IMAGE: {{ image_ref }}
+          APP_BUILD_ARGS: {% raw %}${{ secrets.APP_BUILD_ARGS }}{% endraw %}
         run: |
+          args=()
+          if [ -n "$APP_BUILD_ARGS" ]; then
+            while IFS= read -r kv; do
+              [ -n "$kv" ] && args+=(--build-arg "$kv")
+            done <<< "$APP_BUILD_ARGS"
+          fi
           docker buildx build \
             --output type=image,push=true,oci-mediatypes=true \
             --cache-from "type=registry,ref=${IMAGE}:buildcache" \
             --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max" \
+            --build-arg SENTRY_RELEASE="$TAG" \
+            --build-arg NEXT_PUBLIC_SENTRY_RELEASE="$TAG" \
+            "${args[@]}" \
             -f {{ dockerfile }} \
             -t "${IMAGE}:${TAG}" \
             {{ build_context }}
@@ -73,6 +85,12 @@ jobs:
       image: {{ image_ref }}
       image_tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
       env_url: https://{{ staging_host }}
+{%- if pull_secret_name != 'registry-pull' %}
+      pull_secret_name: {{ pull_secret_name }}
+{%- endif %}
+{%- if db_mode in ['sql-configmap', 'shared-cnpg-database'] %}
+      cnpg_cluster_name: {{ cnpg_cluster_name }}
+{%- endif %}
       cluster_auth: {{ cluster_auth }}
 {%- if cluster_auth == 'gke-wif' %}
       wif_provider: {{ wif_provider }}
@@ -85,6 +103,7 @@ jobs:
     secrets:
       KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}
       APP_ENV: {% raw %}${{ secrets.APP_ENV_STAGING }}{% endraw %}
+      REGISTRY_PULL_TOKEN: {% raw %}${{ secrets.REGISTRY_PULL_TOKEN }}{% endraw %}
 
   deploy-production:
     needs: build
@@ -96,6 +115,12 @@ jobs:
       image: {{ image_ref }}
       image_tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
       env_url: https://{{ production_host }}
+{%- if pull_secret_name != 'registry-pull' %}
+      pull_secret_name: {{ pull_secret_name }}
+{%- endif %}
+{%- if db_mode in ['sql-configmap', 'shared-cnpg-database'] %}
+      cnpg_cluster_name: {{ cnpg_cluster_name }}
+{%- endif %}
       cluster_auth: {{ cluster_auth }}
 {%- if cluster_auth == 'gke-wif' %}
       wif_provider: {{ wif_provider }}
@@ -108,3 +133,4 @@ jobs:
     secrets:
       KUBE_CONFIG: {% raw %}${{ secrets.KUBE_CONFIG }}{% endraw %}
       APP_ENV: {% raw %}${{ secrets.APP_ENV_PRODUCTION }}{% endraw %}
+      REGISTRY_PULL_TOKEN: {% raw %}${{ secrets.REGISTRY_PULL_TOKEN }}{% endraw %}

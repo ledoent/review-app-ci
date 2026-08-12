@@ -85,10 +85,19 @@ try_claim() {
     emit "${held##"$APP-slot-"}"
     return 0
   fi
+  local err
   for i in $(seq 1 "$POOL"); do
-    if lease_manifest "$i" | kubectl create -f - 2>/dev/null; then
+    if err=$(lease_manifest "$i" | kubectl create -f - 2>&1); then
       emit "$i"
       return 0
+    fi
+    # Only "already exists" means the slot is taken. Anything else (RBAC,
+    # API error) must fail loudly — swallowing it would misreport a
+    # permissions problem as "all slots taken" with an empty holder list.
+    if ! grep -Eqi "already ?exists" <<< "$err"; then
+      echo "::error::lease create failed for slot $i (not an AlreadyExists):"
+      printf '%s\n' "$err"
+      exit 1
     fi
   done
   return 1

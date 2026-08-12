@@ -16,18 +16,19 @@ set -euo pipefail
 
 BRANCH="chore/review-app-ci-update"
 
+failed=()
 for repo in "$@"; do
   echo "=== $repo ==="
   tmp=$(mktemp -d)
-  gh repo clone "$repo" "$tmp" -- --depth 50 -q
-
-  if [ ! -f "$tmp/.copier-answers.yml" ]; then
-    echo "skip: no .copier-answers.yml"
-    rm -rf "$tmp"
-    continue
-  fi
-
-  (
+  # One repo's failure must not stop the fleet: the per-repo block runs in a
+  # subshell whose non-zero exit is caught, recorded, and reported at the end.
+  if ! (
+    set -euo pipefail
+    gh repo clone "$repo" "$tmp" -- --depth 50 -q
+    if [ ! -f "$tmp/.copier-answers.yml" ]; then
+      echo "skip: no .copier-answers.yml"
+      exit 0
+    fi
     cd "$tmp"
     git switch -c "$BRANCH"
     if copier update --trust --defaults --skip-answered; then
@@ -43,9 +44,19 @@ for repo in "$@"; do
     fi
     git add -A
     git commit -qm "$title"
-    git push -q -u origin "$BRANCH"
+    # force-with-lease: the branch is machine-owned; a leftover from a prior
+    # rollout must not reject the push and abort this repo.
+    git push -q --force-with-lease -u origin "$BRANCH"
     gh pr create --repo "$repo" --title "$title" --body "$body" \
       --head "$BRANCH" || echo "PR already open"
-  )
+  ); then
+    echo "::warning::$repo failed"
+    failed+=("$repo")
+  fi
   rm -rf "$tmp"
 done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "failed repos: ${failed[*]}"
+  exit 1
+fi
