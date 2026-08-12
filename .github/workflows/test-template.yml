@@ -78,8 +78,10 @@ jobs:
         run: |
           set -euo pipefail
           # Review ingresses must never carry a cluster-issuer: cert-manager
-          # would seize the shared wildcard secret and reissue it.
-          if grep -rn "cluster-issuer" /tmp/render/deploy/overlays/review/; then
+          # would seize the shared wildcard secret and reissue it. Match only
+          # real annotation usage (key with colon on a non-comment line) —
+          # the overlay's own comments explain the rule and must not trip it.
+          if grep -rEn '^[^#]*cluster-issuer:' /tmp/render/deploy/overlays/review/; then
             echo "::error::review overlay must not set cert-manager.io/cluster-issuer"; exit 1
           fi
           # SMTP credentials must never be copied into review namespaces.
