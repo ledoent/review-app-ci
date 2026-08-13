@@ -178,17 +178,16 @@ jobs:
           done <<< "$PATHS"
           npx --yes @lhci/cli@0.15.x collect "${urls[@]}" \
             --collect.numberOfRuns="$RUNS" "${extra[@]}"
+          # collect leaves raw LHRs in .lighthouseci; manifest.json (median
+          # runs, summaries) is only produced by the filesystem upload target.
+          npx --yes @lhci/cli@0.15.x upload --target=filesystem \
+            --upload.outputDir=lhci-report
 
       - name: Summarize
         id: summary
         run: |
           set -euo pipefail
-          # lhci writes .lighthouseci relative to the --config file's
-          # directory, not the cwd — locate it rather than assume.
-          LH_DIR=$(dirname "$(find . -path '*/.lighthouseci/manifest.json' -not -path './.review-ci/*' | head -1)")
-          [ -n "$LH_DIR" ] && [ "$LH_DIR" != "." ] || { echo "::error::no .lighthouseci/manifest.json found"; exit 1; }
-          echo "dir=$LH_DIR" >> "$GITHUB_OUTPUT"
-          node .review-ci/scripts/lh-summary.mjs "$LH_DIR"
+          node .review-ci/scripts/lh-summary.mjs lhci-report
           {
             echo "table<<LHEOF"
             cat lh-summary.md
@@ -201,7 +200,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lighthouse-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.summary.outputs.dir || '.lighthouseci' }}
+          path: lhci-report
           retention-days: 7
           if-no-files-found: ignore
 
