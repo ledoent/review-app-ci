@@ -60,6 +60,12 @@ jobs:
     if: inputs.e2e_command != ''
     runs-on: ${{ inputs.runs_on }}
     continue-on-error: ${{ inputs.advisory == 'true' }}
+    # Containers may default run steps to plain sh, where `set -o pipefail`
+    # is an illegal option — force bash (observed live in the bimble
+    # ci-runner image).
+    defaults:
+      run:
+        shell: bash
     # ghcr images get the workflow token as pull credentials (needed for
     # private ci-runner images); other registries (mcr, docker.io) stay
     # anonymous — sending GitHub credentials at them fails the login.
@@ -118,6 +124,12 @@ jobs:
     if: inputs.lighthouse_paths != ''
     runs-on: ${{ inputs.runs_on }}
     continue-on-error: ${{ inputs.advisory == 'true' }}
+    # Containers may default run steps to plain sh, where `set -o pipefail`
+    # is an illegal option — force bash (observed live in the bimble
+    # ci-runner image).
+    defaults:
+      run:
+        shell: bash
     container: ${{ startsWith(inputs.lighthouse_container, 'ghcr.io/') && fromJSON(format('{{"image":{0},"credentials":{{"username":{1},"password":{2}}}}}', toJSON(inputs.lighthouse_container), toJSON(github.actor), toJSON(github.token))) || inputs.lighthouse_container }}
     steps:
       # App checkout first: lighthouse_config is a repo-relative path.
