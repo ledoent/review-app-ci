@@ -162,6 +162,11 @@ jobs:
           if [ -n "$LHCI_CONFIG" ]; then
             extra+=(--config="$LHCI_CONFIG")
           fi
+          # Explicit, not only via the rc file: CLI --collect.settings.*
+          # overrides can clobber the rc's settings object, and in a container
+          # Chrome runs as root — without --no-sandbox it dies at the zygote
+          # ("Unable to connect to Chrome", observed live).
+          extra+=(--collect.settings.chromeFlags="--no-sandbox --headless=new --disable-dev-shm-usage")
           if [ -n "$BASIC_AUTH" ]; then
             auth=$(printf '%s' "$BASIC_AUTH" | base64 -w0 2>/dev/null || printf '%s' "$BASIC_AUTH" | base64)
             extra+=(--collect.settings.extraHeaders="{\"Authorization\":\"Basic $auth\"}")
