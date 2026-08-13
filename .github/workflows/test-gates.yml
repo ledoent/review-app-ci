@@ -183,7 +183,12 @@ jobs:
         id: summary
         run: |
           set -euo pipefail
-          node .review-ci/scripts/lh-summary.mjs
+          # lhci writes .lighthouseci relative to the --config file's
+          # directory, not the cwd — locate it rather than assume.
+          LH_DIR=$(dirname "$(find . -path '*/.lighthouseci/manifest.json' -not -path './.review-ci/*' | head -1)")
+          [ -n "$LH_DIR" ] && [ "$LH_DIR" != "." ] || { echo "::error::no .lighthouseci/manifest.json found"; exit 1; }
+          echo "dir=$LH_DIR" >> "$GITHUB_OUTPUT"
+          node .review-ci/scripts/lh-summary.mjs "$LH_DIR"
           {
             echo "table<<LHEOF"
             cat lh-summary.md
@@ -196,7 +201,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lighthouse-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
-          path: .lighthouseci
+          path: ${{ steps.summary.outputs.dir || '.lighthouseci' }}
           retention-days: 7
           if-no-files-found: ignore
 
