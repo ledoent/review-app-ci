@@ -471,25 +471,35 @@ jobs:
             echo "db secret $DB_SECRET synthesised"
           fi
 
-      # Full tier, phase 1: the seed ConfigMap must exist BEFORE the CNPG
-      # cluster boots — postInitApplicationSQLRefs with a missing ref leaves
-      # the cluster hanging, not failing.
-      - name: Seed ConfigMap + CNPG cluster (sql-configmap)
-        if: inputs.db_mode == 'sql-configmap'
+      # Seed ConfigMap must exist BEFORE the CNPG cluster boots —
+      # postInitApplicationSQLRefs with a missing ref leaves the cluster
+      # hanging, not failing.
+      - name: Seed ConfigMap (sql-configmap)
+        if: inputs.db_mode == 'sql-configmap' && inputs.seed_path != ''
         env:
           SEED_PATH: ${{ inputs.seed_path }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" create configmap "${APP}-review-seed" \
+            --from-file="seed.sql=$SEED_PATH" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Independent of the SEEDING mode: any full-tier app with its own
+      # per-PR cluster (cad-plm seeds via app endpoint, bimble via SQL) needs
+      # the cluster applied and Ready before the overlay's rollout clock
+      # starts.
+      - name: CNPG cluster (phase 1)
+        if: inputs.tier == 'full' && inputs.cnpg_cluster_name != ''
+        env:
           OVERLAY: ${{ inputs.overlay }}
           CLUSTER_NAME: ${{ inputs.cnpg_cluster_name }}
         run: |
           set -euo pipefail
-          if [ -n "$SEED_PATH" ]; then
-            kubectl -n "$NS" create configmap "${APP}-review-seed" \
-              --from-file="seed.sql=$SEED_PATH" \
-              --dry-run=client -o yaml | kubectl apply -f -
-          fi
-          if [ -f "$OVERLAY/cnpg-cluster.yaml" ] && [ -n "$CLUSTER_NAME" ]; then
+          if [ -f "$OVERLAY/cnpg-cluster.yaml" ]; then
             kubectl -n "$NS" apply -f "$OVERLAY/cnpg-cluster.yaml"
             kubectl -n "$NS" wait --for=condition=Ready "cluster/$CLUSTER_NAME" --timeout=300s
+          else
+            echo "no $OVERLAY/cnpg-cluster.yaml; skipping"
           fi
 
       - name: Write overlay params
