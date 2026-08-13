@@ -15,7 +15,7 @@ build_context: storefront
 review_trigger: label
 review_label: review
 review_tier: light
-shared_backend_namespace: duropc-staging
+staging_namespace: duropc-staging
 # Real duropc answers use base_component: storefront; the fixture uses '.' so
 # the scaffolded base satisfies the kustomize-build validation.
 base_component: "."

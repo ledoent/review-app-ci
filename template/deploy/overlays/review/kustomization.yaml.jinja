@@ -21,7 +21,7 @@ namespace: {{ app_name }}-pr0
 resources:
 {%- if review_tier == 'light' %}
   # Light tier: only the app itself. The backend (Saleor, Typesense, ...)
-  # stays in {{ shared_backend_namespace }} and is reached cross-namespace.
+  # stays in {{ staging_namespace }} and is reached cross-namespace.
   - ../../base{% if base_component != '.' %}/{{ base_component }}{% endif %}
 {%- else %}
   - ../../base

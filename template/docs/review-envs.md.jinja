@@ -21,7 +21,7 @@ down.
   atomically per PR, lowest free wins, released on teardown. See
   `deploy/overlays/review/SLOTS.md` before changing the pool size.
 - Tier: **{{ review_tier }}**{% if review_tier == 'light' %} (backend borrowed
-  from `{{ shared_backend_namespace }}` — it must be up){% endif %}
+  from `{{ staging_namespace }}` — it must be up){% endif %}
 - TTL: `vars.REVIEW_TTL_HOURS` (default 48h) — the nightly sweep reaps older
   environments even when the PR is open; redeploy to rebuild.
 - Mail: sunk to Mailpit in-cluster. Review environments can never send real

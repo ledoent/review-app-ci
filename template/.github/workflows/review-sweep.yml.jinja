@@ -26,7 +26,7 @@ jobs:
       app_name: {{ app_name }}
 {%- if db_mode == 'shared-cnpg-database' %}
       db_name_prefix: {{ db_name_prefix | replace('_', '-') }}
-      staging_namespace: {{ shared_backend_namespace }}
+      staging_namespace: {{ staging_namespace }}
 {%- endif %}
 {%- if review_trigger == 'label' %}
       review_labels: "{{ review_label }}"

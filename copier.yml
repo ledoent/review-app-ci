@@ -144,10 +144,10 @@ review_tier:
     light deploys only this app and borrows the backend (Saleor, Typesense,
     ...) from a shared staging namespace; full is self-contained per PR.
 
-shared_backend_namespace:
+staging_namespace:
   type: str
   default: "{{ app_name }}-staging"
-  when: "{{ review_tier == 'light' }}"
+  help: "Staging namespace (secrets source for reviews; light tier's borrowed backend). Not always <app>-staging: cad-plm's is cadplm-staging."
 
 base_component:
   type: str

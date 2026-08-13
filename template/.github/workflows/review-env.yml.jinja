@@ -43,7 +43,7 @@ jobs:
 {%- endif %}
 {%- if db_mode == 'shared-cnpg-database' %}
       db_name_prefix: {{ db_name_prefix | replace('_', '-') }}
-      staging_namespace: {{ shared_backend_namespace }}
+      staging_namespace: {{ staging_namespace }}
 {%- endif %}
       runs_on: {{ runner }}
     secrets:
@@ -145,12 +145,12 @@ jobs:
       slot_count: "{{ slot_count }}"
       tier: {{ review_tier }}
 {%- if review_tier == 'light' %}
-      staging_namespace: {{ shared_backend_namespace }}
+      staging_namespace: {{ staging_namespace }}
 {%- if staging_deployments %}
       staging_deployments: "{{ staging_deployments }}"
 {%- endif %}
 {%- elif shared_secrets_to_copy %}
-      staging_namespace: {{ app_name }}-staging
+      staging_namespace: {{ staging_namespace }}
 {%- endif %}
 {%- if shared_secrets_to_copy %}
       copy_secrets: "{{ shared_secrets_to_copy }}"

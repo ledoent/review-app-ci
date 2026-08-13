@@ -6,6 +6,8 @@ cluster_auth: kubeconfig
 review_trigger: auto
 review_tier: full
 db_mode: app-endpoint
+staging_namespace: cadplm-staging
+shared_secrets_to_copy: "cadplm-secrets,ghcr-pull"
 seed_command: "scripts/seed-admin.sh"
 generated_secret_keys: "BETTER_AUTH_SECRET"
 host_in_build: false
