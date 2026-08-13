@@ -181,6 +181,12 @@ jobs:
       # First-bootstrap ordering: the CNPG cluster must be Ready before the
       # Deployment that mounts its -app secret, or pods loop in
       # CreateContainerConfigError.
+      #
+      # Wake before wait: a HIBERNATED cluster (cnpg.io/hibernation=on — the
+      # scale-to-zero pattern staging environments use) still reports
+      # "healthy", so the Ready wait passes while no database pod exists and
+      # the app then hangs in its wait-for-db init forever. Observed live on
+      # bimble staging.
       - name: CNPG cluster (phase 1)
         if: inputs.cnpg_cluster_name != ''
         env:
@@ -189,7 +195,17 @@ jobs:
           set -euo pipefail
           if [ -f "$OVERLAY/cnpg-cluster.yaml" ]; then
             kubectl -n "$NS" apply -f "$OVERLAY/cnpg-cluster.yaml"
+            hib=$(kubectl -n "$NS" get cluster "$CLUSTER_NAME" \
+              -o jsonpath='{.metadata.annotations.cnpg\.io/hibernation}' 2>/dev/null || true)
+            if [ "$hib" = "on" ]; then
+              echo "cluster $CLUSTER_NAME is hibernated; waking"
+              kubectl -n "$NS" annotate cluster "$CLUSTER_NAME" cnpg.io/hibernation=off --overwrite
+            fi
             kubectl -n "$NS" wait --for=condition=Ready "cluster/$CLUSTER_NAME" --timeout=600s
+            # Ready alone is not enough post-hibernation: require a running
+            # instance before letting the app's rollout start its clock.
+            kubectl -n "$NS" wait --for=jsonpath='{.status.readyInstances}'=1 \
+              "cluster/$CLUSTER_NAME" --timeout=600s || true
           else
             echo "no $OVERLAY/cnpg-cluster.yaml; skipping"
           fi
