@@ -156,7 +156,7 @@ jobs:
       copy_secrets: "{{ shared_secrets_to_copy }}"
 {%- endif %}
       db_mode: {{ db_mode }}
-{%- if db_mode in ['sql-configmap', 'shared-cnpg-database'] %}
+{%- if db_mode in ['sql-configmap', 'shared-cnpg-database', 'app-endpoint'] %}
       cnpg_cluster_name: {{ cnpg_cluster_name }}
 {%- endif %}
 {%- if db_mode == 'shared-cnpg-database' %}

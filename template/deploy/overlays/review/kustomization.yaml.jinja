@@ -25,7 +25,7 @@ resources:
   - ../../base{% if base_component != '.' %}/{{ base_component }}{% endif %}
 {%- else %}
   - ../../base
-{%- if db_mode == 'sql-configmap' %}
+{%- if db_mode != 'none' %}
   - cnpg-cluster.yaml
 {%- endif %}
 {%- endif %}

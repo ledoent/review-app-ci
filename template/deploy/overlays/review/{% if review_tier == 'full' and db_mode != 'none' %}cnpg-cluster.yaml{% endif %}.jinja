@@ -21,7 +21,7 @@ spec:
     initdb:
       database: app
       owner: app
-{%- if use_seed_sql %}
+{%- if db_mode == 'sql-configmap' and use_seed_sql %}
       postInitApplicationSQLRefs:
         configMapRefs:
           - name: {{ app_name }}-review-seed

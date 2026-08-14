@@ -174,7 +174,7 @@ db_mode:
 cnpg_cluster_name:
   type: str
   default: "{{ app_name }}-db"
-  when: "{{ db_mode in ['sql-configmap', 'shared-cnpg-database'] }}"
+  when: "{{ db_mode in ['sql-configmap', 'shared-cnpg-database', 'app-endpoint'] }}"
 
 db_name_prefix:
   type: str
