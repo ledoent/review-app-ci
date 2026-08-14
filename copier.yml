@@ -149,6 +149,12 @@ staging_namespace:
   default: "{{ app_name }}-staging"
   help: "Staging namespace (secrets source for reviews; light tier's borrowed backend). Not always <app>-staging: cad-plm's is cadplm-staging."
 
+production_namespace:
+  type: str
+  default: "{{ app_name }}-production"
+  help: "Production namespace (cad-plm's is cadplm-production)"
+  when: "{{ manage_deploy_workflow }}"
+
 base_component:
   type: str
   default: "."

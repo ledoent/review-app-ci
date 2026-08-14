@@ -82,6 +82,7 @@ jobs:
     with:
       environment: staging
       app_name: {{ app_name }}
+      namespace: {{ staging_namespace }}
       image: {{ image_ref }}
       image_tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
       env_url: https://{{ staging_host }}
@@ -112,6 +113,7 @@ jobs:
     with:
       environment: production
       app_name: {{ app_name }}
+      namespace: {{ production_namespace }}
       image: {{ image_ref }}
       image_tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
       env_url: https://{{ production_host }}
