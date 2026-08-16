@@ -28,9 +28,25 @@ on:
         type: string
         required: true
       migrator_image:
-        description: Optional migration image (untagged); run as a Job before rollout wait
+        description: Optional migration image (untagged); retagged, and run as a Job unless migrator_job is false
         type: string
         default: ""
+      migrator_job:
+        # Some apps already migrate in an initContainer on their own Deployment,
+        # which is strictly better: it runs on every rollout, it cannot drift
+        # from the app's own env wiring, and the rollout wait already gates on
+        # it. Those apps still need migrator_image so the image gets retagged to
+        # the immutable per-push tag — an initContainer left on :latest would
+        # migrate a review environment with a different commit's schema.
+        #
+        # The Job builds env with `envFrom: secretRef`, which names variables
+        # after the SECRET KEYS. An app expecting DATABASE_URI gets `uri`
+        # instead and silently falls back to its local-dev default, which
+        # surfaces as ECONNREFUSED on 127.0.0.1 — a confusing way to learn that
+        # two migration paths were running.
+        description: '"false" = retag the migrator image but do not run the Job (the app migrates in an initContainer)'
+        type: string
+        default: "true"
       base_domain:
         # Free-form: the slot host is "<app>-pr<N>.<base_domain>" and nothing
         # validates it against a list. In use today: hz.ledoweb.com,
@@ -555,7 +571,7 @@ jobs:
       # (private registries) and the app's env wiring (params ConfigMap +
       # DB secret) or it can't reach the database it is migrating.
       - name: Run migrations
-        if: inputs.migrator_image != ''
+        if: inputs.migrator_image != '' && inputs.migrator_job != 'false'
         env:
           MIGRATOR: ${{ inputs.migrator_image }}
           TAG: ${{ inputs.image_tag }}
