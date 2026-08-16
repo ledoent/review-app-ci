@@ -32,7 +32,12 @@ on:
         type: string
         default: ""
       base_domain:
-        description: Review domain (hz.ledoweb.com | mi.ledoweb.com)
+        # Free-form: the slot host is "<app>-pr<N>.<base_domain>" and nothing
+        # validates it against a list. In use today: hz.ledoweb.com,
+        # mi.ledoweb.com, p.duropc.com. The name must be covered by the wildcard
+        # TLS secret named in wildcard_secret, and a wildcard matches exactly one
+        # label — so a domain one level deeper needs its own certificate.
+        description: Review domain, e.g. hz.ledoweb.com / mi.ledoweb.com / p.duropc.com
         type: string
         default: hz.ledoweb.com
       slot_count:
@@ -630,16 +635,43 @@ jobs:
           BASIC_AUTH: ${{ inputs.basic_auth }}
         run: |
           set -euo pipefail
-          # 200/302 prove DNS, TLS, ingress and app. 401 is success only when
-          # basic auth is on — anywhere else it means the app is broken.
-          ok="200|302"
-          [ "$BASIC_AUTH" = "true" ] && ok="200|302|401"
+          # FOLLOWS REDIRECTS, AND THAT IS THE POINT OF THIS STEP.
+          #
+          # This check used to accept a bare 302 as proof of life. It is not:
+          # a 302 says the ingress matched a rule, and says nothing whatever
+          # about where it points. duropc review environments redirected to an
+          # SSO host that had never been built, so every deploy went green
+          # while every environment 404'd — for three days, until a human
+          # opened one. The first hop was 302 and the check never looked further.
+          #
+          # -L collapses that blind spot: assert the status the BROWSER ends on.
+          # A redirect to a dead host now reports the 404 it really is.
+          #
+          # 401 is success only when basic auth is on. Anywhere else it means
+          # the app itself is rejecting the request, which is a broken
+          # environment wearing a plausible status code.
+          ok="200"
+          [ "$BASIC_AUTH" = "true" ] && ok="200|401"
           for _ in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$URL/" || true)
+            # --max-redirs bounds a redirect loop, which is the other way this
+            # can fail: a cookie scoped to the wrong domain sends the browser
+            # round for ever, and an unbounded -L would hang until the job timed
+            # out rather than reporting anything useful.
+            code=$(curl -sSL -o /dev/null -w '%{http_code}' -m 15 --max-redirs 5 "$URL/" || true)
             if echo "$code" | grep -qE "^($ok)$"; then echo "$URL -> $code"; exit 0; fi
             sleep 5
           done
-          echo "::error::$URL never responded acceptably (last: ${code:-none})"; exit 1
+          echo "::error::$URL never responded acceptably (final status after redirects: ${code:-none}, wanted $ok)"
+          echo "Read the status as the END of the chain, not the first hop:"
+          echo "  404, or a TLS error naming 'Kubernetes Ingress Controller Fake Certificate',"
+          echo "       means the redirect target has no ingress claiming it. Check for"
+          echo "       auth-signin / auth-url annotations on the review ingress — per ADR-009"
+          echo "       (measinst/infra) review ingresses must not carry them, and access"
+          echo "       control is basic_auth: \"true\" on this workflow."
+          echo "  401 with basic_auth false means the app is rejecting the request itself."
+          echo "  Exhausted redirects means a loop, usually a session cookie scoped to a"
+          echo "       different domain than the host being protected."
+          exit 1
 
       - name: PR comment
         uses: ./.review-ci/actions/sticky-comment
